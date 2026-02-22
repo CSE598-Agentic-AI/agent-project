@@ -1,4 +1,4 @@
-#!/bin/bash
+h#!/bin/bash
 
 cd ~/agent-project
 
