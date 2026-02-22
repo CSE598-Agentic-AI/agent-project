@@ -142,29 +142,30 @@ class ProgressViewer():
 
     def progress_by_model(self):
         trials = [1, 2, 3, 4, 5]
+        strategies = ["act", "react", "fc"]
 
-        retail_tasks = 115 
-        airline_tasks = 50 
+        retail_tasks = 115
+        airline_tasks = 50
         total_retail_tasks = 0
         total_airline_tasks = 0
         for trial in trials:
             total_retail_tasks += retail_tasks * trial
             total_airline_tasks += airline_tasks * trial
         total_tasks = total_retail_tasks + total_airline_tasks
-        completion = self.count_completed_tasks_in_folder(retail_tasks)
-        completion += self.count_completed_tasks_in_folder(retail_tasks)
-        completion += self.count_completed_tasks_in_folder(retail_tasks)
-        
-        completion += self.count_completed_tasks_in_folder(airline_tasks)
-        completion += self.count_completed_tasks_in_folder(airline_tasks)
-        completion += self.count_completed_tasks_in_folder(airline_tasks)
-        completion = completion / total_tasks * 100 # 3 strategies (act, react, fc)
+        completion = 0
+        for strategy in strategies:
+            self.set_folder_path(f"results/retail/{strategy}/{self.model_size}")
+            completion += self.count_completed_tasks_in_folder(retail_tasks)
+        for strategy in strategies:
+            self.set_folder_path(f"results/airline/{strategy}/{self.model_size}")
+            completion += self.count_completed_tasks_in_folder(airline_tasks)
+        completion = completion / total_tasks * 100  # 3 strategies (act, react, fc)
         print(f"Qwen{self.model_size} completion: {completion:.2f}%")
 
 
     def detailed_progress(self):
         print(f"Printing task trials in {self.folder_path}      -------------------------")
-        self.run_on_all_files_in_folder(self.print_task_trials(group_by_task=True))
+        self.run_on_all_files_in_folder(lambda: self.print_task_trials(group_by_task=True))
         print(f"Printing missing task ids in {self.folder_path} -------------------------")
         self.run_on_all_files_in_folder(self.missing_task_ids)
 
