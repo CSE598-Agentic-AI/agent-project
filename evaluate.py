@@ -39,7 +39,7 @@ class Evaluator():
         # Create DataFrame for table
         df = pd.DataFrame(records)
         df = df.sort_values(by=["task_id", "trial"])
-        print("Task Results Table:")
+        print(f"{self.file_path}")
         print(df.to_string(index=False))
 
         # Pivot for heatmap: Rows=task_id, Cols=trial, Values=score

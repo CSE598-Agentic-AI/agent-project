@@ -57,8 +57,14 @@ if __name__ == "__main__":
   # progress_viewer.detailed_progress()
 
   # -------------------------------------------------------------------------
-  # STEP 3: Evaluate the results
+  # STEP 3: Evaluate the results and graph progress
   # -------------------------------------------------------------------------
+  # For each num_trials-*.json file in the folder:
+  #   - Reads task_id, trial, and score (reward/score/result) from each entry
+  #   - Prints a table of (task_id, trial, score)
+  #   - Pivots data into a heatmap: rows=task_id, columns=trial, color=score
+  #   - Shows a matplotlib window with viridis colormap (darker=lower, lighter=higher)
+  #   - plt.show() blocks until you close each figure; close to see the next file
   print(f"Evaluating results in {folder_path}            --------------------------")
   evaluator.evaluate_folder()
 
