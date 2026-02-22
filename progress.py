@@ -168,4 +168,3 @@ class ProgressViewer():
         self.run_on_all_files_in_folder(lambda: self.print_task_trials(group_by_task=True))
         print(f"Printing missing task ids in {self.folder_path} -------------------------")
         self.run_on_all_files_in_folder(self.missing_task_ids)
-
