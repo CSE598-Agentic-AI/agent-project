@@ -21,7 +21,7 @@ if __name__ == "__main__":
   # -------------------------------------------------------------------------
   model_size = "4B"   # Options: "4B", "8B", "14B", "32B"
   env = "airline"     # Options: "airline" (50 tasks), "retail" (115 tasks)
-  strategy = "act"    # Options: "act", "react", "fc"
+  strategy = "react"    # Options: "act", "react", "fc"
 
   folder_path = f"results/{env}/{strategy}/{model_size}"
 
@@ -54,7 +54,7 @@ if __name__ == "__main__":
 
   # detailed_progress() gives a per-folder view: task_id -> trials mapping and
   # missing task IDs (useful for resuming failed experiments)
-  # progress_viewer.detailed_progress()
+  progress_viewer.detailed_progress(folder_path)
 
   # -------------------------------------------------------------------------
   # STEP 3: Evaluate the results and graph progress
@@ -65,7 +65,7 @@ if __name__ == "__main__":
   #   - Pivots data into a heatmap: rows=task_id, columns=trial, color=score
   #   - Shows a matplotlib window with viridis colormap (darker=lower, lighter=higher)
   #   - plt.show() blocks until you close each figure; close to see the next file
-  print(f"Evaluating results in {folder_path}            --------------------------")
-  evaluator.evaluate_folder()
+  # print(f"Evaluating results in {folder_path}            --------------------------")
+  # evaluator.evaluate_folder()
 
 

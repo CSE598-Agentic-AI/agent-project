@@ -17,10 +17,10 @@
 # =============================================================================
 # PATHS & ENVIRONMENTS — change these for your setup before sharing/running
 # =============================================================================
-WORK_DIR="/scratch/sdutta60/vllm-test"                    # Working directory (where you cd before running)
+WORK_DIR="/scratch/baspinal/vllm-test"                               # Working directory (where you cd before running)
 TAU_BENCH_DIR="${WORK_DIR}/agent-project/tau-bench"        # Path to tau-bench repo (run script lives here)
 LOG_DIR="${WORK_DIR}/logs"                                 # Directory for vLLM and error-id logs
-HF_DOWNLOAD_DIR="/scratch/sdutta60/huggingface_models/vllm"  # vLLM model download cache
+HF_DOWNLOAD_DIR="/scratch/baspinal/huggingface_models/vllm"  # vLLM model download cache
 RESULTS_PATH="${TAU_BENCH_DIR}/../results/num_trials-1.json" # Path to tau-bench results JSON to analyze
 VLLM_ENV="gaudi-pytorch-vllm"   # Conda/mamba env for running vLLM server
 TAU_BENCH_ENV="tau-scratch-v1"  # Conda/mamba env for running tau-bench / error identification script

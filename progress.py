@@ -63,6 +63,30 @@ class ProgressViewer():
                 task_to_trials[task_id] = []
             task_to_trials[task_id].append(trial_num)
 
+        # Check if file is done (all tasks with all expected trials)
+        path_parts = self.file_path.replace("\\", "/").split("/")
+        env = path_parts[-4] if len(path_parts) >= 4 else "airline"
+        total_tasks = 115 if env == "retail" else 50
+        trial_str = (path_parts[-1] if path_parts else "num_trials-1.json").split("-")[-1].split(".")[0]
+        try:
+            expected_trials = int(trial_str)
+        except ValueError:
+            expected_trials = 1
+        expected_trial_set = set(range(expected_trials))
+
+        all_done = (
+            len(task_to_trials) == total_tasks
+            and all(
+                expected_trial_set.issubset({t for t in trials if t is not None})
+                for trials in task_to_trials.values()
+            )
+        )
+
+        if all_done:
+            print(f"\n{self.file_path}")
+            print("  Done")
+            return
+
         print(f"\nTask IDs mapped to trials in {self.file_path}:")
         for task_id in sorted(task_to_trials.keys()):
             observed = task_to_trials[task_id]
@@ -94,7 +118,7 @@ class ProgressViewer():
         missing = [i for i in range(total_tasks) if i not in completed]
         if len(missing) == 0:
             print(f"\n{self.file_path}")
-            print(f"  All tasks have at least one trial completed. Check task_id to trial mapping above to see if any trials are missing.")
+            print("  No missing task IDs")
             return None
         completed_count = len(completed)
         missing_str = ", ".join(map(str, missing))
@@ -163,7 +187,8 @@ class ProgressViewer():
         print(f"Qwen{self.model_size} completion: {completion:.2f}%")
 
 
-    def detailed_progress(self):
+    def detailed_progress(self, folder_path):
+        self.set_folder_path(folder_path)
         print(f"Printing task trials in {self.folder_path}      -------------------------")
         self.run_on_all_files_in_folder(lambda: self.print_task_trials(group_by_task=True))
         print(f"Printing missing task ids in {self.folder_path} -------------------------")

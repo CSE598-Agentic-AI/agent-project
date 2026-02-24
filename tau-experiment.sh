@@ -15,7 +15,7 @@ set -euo pipefail
 #########################################
 # ROOT DIR (this script is designed for)
 #########################################
-ROOT_DIR="${HOME}/agent-project"
+ROOT_DIR="/scratch/baspinal/agent-project"
 LOG_DIR="${ROOT_DIR}/logs"
 ERROR_DIR="${ROOT_DIR}/errors"
 BASE_RESULTS_DIR="${ROOT_DIR}/results"
@@ -66,17 +66,35 @@ TOTAL=$((NUM_ENVS * NUM_AGENTS * NUM_MODELS * NUM_TRIALS))  # 120
 # ARGUMENT / ARRAY HANDLING
 #########################################
 # Modes:
-#   1) Single run (CLI): sbatch tau-experiment.sh <env> <agent> <assist_model> [num_trials]
-#   2) Array mode:      sbatch --array=0-119 tau-experiment.sh
+#   1) Single run (CLI): sbatch tau-experiment.sh [--start-index N] [--end-index M] <env> <agent> <assist_model> [num_trials]
+#   2) Array mode:      sbatch --array=0-119 tau-experiment.sh [--start-index N] [--end-index M]
 #########################################
 
-if [ "$#" -ge 3 ]; then
+# Parse optional --start-index and --end-index (defaults: 0, -1)
+START_INDEX=0
+END_INDEX=-1
+ARGS=()
+i=1
+while [[ $i -le $# ]]; do
+  if [[ "${!i}" == "--start-index" ]] && [[ $i -lt $# ]]; then
+    ((i++))
+    START_INDEX="${!i}"
+  elif [[ "${!i}" == "--end-index" ]] && [[ $i -lt $# ]]; then
+    ((i++))
+    END_INDEX="${!i}"
+  else
+    ARGS+=("${!i}")
+  fi
+  ((i++))
+done
+
+if [ "${#ARGS[@]}" -ge 3 ]; then
   # ----- Mode 1: direct arguments (single experiment) -----
-  ENV_NAME="$1"
-  AGENT_STRAT_INPUT="$2"
-  ASSIST_MODEL="$3"
-  if [ "$#" -ge 4 ]; then
-    NUM_TRIALS_VAL="$4"
+  ENV_NAME="${ARGS[0]}"
+  AGENT_STRAT_INPUT="${ARGS[1]}"
+  ASSIST_MODEL="${ARGS[2]}"
+  if [ "${#ARGS[@]}" -ge 4 ]; then
+    NUM_TRIALS_VAL="${ARGS[3]}"
   else
     NUM_TRIALS_VAL=5
   fi
@@ -99,10 +117,10 @@ else
     cat <<EOF
 Usage:
   Single run:
-    sbatch tau-experiment.sh <env: retail|airline> <agent: act|react|fc> <assistant_model_id> [num_trials]
+    sbatch tau-experiment.sh [--start-index N] [--end-index M] <env: retail|airline> <agent: act|react|fc> <assistant_model_id> [num_trials]
 
   Full sweep (job array, 120 experiments):
-    sbatch --array=0-$((TOTAL-1)) tau-experiment.sh
+    sbatch --array=0-$((TOTAL-1)) tau-experiment.sh [--start-index N] [--end-index M]
 EOF
     exit 1
   fi
@@ -176,6 +194,8 @@ echo "Agent strategy:      $AGENT_STRAT_INPUT (CLI: $AGENT_STRAT_CLI)"
 echo "Assistant model:     $ASSIST_MODEL"
 echo "User model (fixed):  $USER_MODEL (remote)"
 echo "Num trials:          $NUM_TRIALS_VAL"
+echo "Start index:         $START_INDEX"
+echo "End index:           $END_INDEX"
 echo "Model size bucket:   $MODEL_SIZE"
 echo "========================================"
 echo
@@ -286,83 +306,6 @@ cd "${ROOT_DIR}/tau-bench"
 echo "Running Tau-Bench..."
 echo
 
-# Usage: set START_INDEX for resume; call before the python run.
-# Updated to:
-#   - Identify missing task_id gaps among [0..TOTAL_TASKS-1] in the checkpoint
-#   - Resume over the largest contiguous gap of incomplete (missing) tasks
-#   - If no gaps (all tasks present), set SKIP_RUN=1 to avoid re-running
-set_start_index_from_checkpoint() {
-  local ckpt="${RESULTS_SUBDIR}/num_trials-${NUM_TRIALS_VAL}.json"
-  START_INDEX=0
-  END_INDEX=-1
-  SKIP_RUN=0
-
-  if [[ -f "$ckpt" ]]; then
-    # Find missing task_ids (incomplete tasks) in the range [0 .. TOTAL_TASKS-1]
-    # Determine the largest contiguous gap and resume over that interval.
-    local -a missing_ids=()
-    # Use process substitution; requires bash (shebang is /bin/bash)
-    # If jq fails or emits nothing, treat as no present ids -> all are missing.
-    if mapfile -t missing_ids < <(comm -23 <(seq 0 $((TOTAL_TASKS-1))) <(jq -r '.[].task_id' "$ckpt" 2>/dev/null | sort -n | uniq)); then
-      :
-    else
-      # On any failure, default to considering all tasks missing
-      mapfile -t missing_ids < <(seq 0 $((TOTAL_TASKS-1)))
-    fi
-
-    if (( ${#missing_ids[@]} == 0 )); then
-      echo "Checkpoint indicates all ${TOTAL_TASKS} tasks are present; no gaps to fill. Skipping run."
-      SKIP_RUN=1
-      START_INDEX=0
-      END_INDEX=-1
-    else
-      # Scan for the largest contiguous gap among missing_ids
-      local best_start best_len
-      local curr_start curr_prev
-      best_start=${missing_ids[0]}
-      best_len=1
-      curr_start=${missing_ids[0]}
-      curr_prev=${missing_ids[0]}
-
-      local i id curr_len
-      for (( i=1; i<${#missing_ids[@]}; i++ )); do
-        id=${missing_ids[$i]}
-        if (( id == curr_prev + 1 )); then
-          # still contiguous
-          curr_prev=$id
-        else
-          # end current gap
-          curr_len=$((curr_prev - curr_start + 1))
-          if (( curr_len > best_len )); then
-            best_len=$curr_len
-            best_start=$curr_start
-          fi
-          # start new gap
-          curr_start=$id
-          curr_prev=$id
-        fi
-      done
-      # finalize last gap
-      curr_len=$((curr_prev - curr_start + 1))
-      if (( curr_len > best_len )); then
-        best_len=$curr_len
-        best_start=$curr_start
-      fi
-
-      START_INDEX="$best_start"
-      local end_excl=$((best_start + best_len))
-      if (( end_excl >= TOTAL_TASKS )); then
-        END_INDEX=-1  # run.py treats -1 as "to the end"
-        echo "Resuming: largest incomplete gap is task_id=${START_INDEX}..$((TOTAL_TASKS-1)) (inclusive) [size=${best_len}]"
-      else
-        END_INDEX="$end_excl"
-        echo "Resuming: largest incomplete gap is task_id=${START_INDEX}..$((END_INDEX-1)) (inclusive) [size=${best_len}]"
-      fi
-    fi
-  else
-    echo "No checkpoint file at $ckpt; starting from first task (start-index=0)."
-  fi
-}
 
 # Total tasks (test split): retail=115, airline=50 (zero-indexed: 0..114, 0..49)
 case "$ENV_NAME" in
@@ -371,7 +314,6 @@ case "$ENV_NAME" in
   *)       TOTAL_TASKS=0 ;;
 esac
 
-set_start_index_from_checkpoint
 
 if [[ "${SKIP_RUN:-0}" -eq 1 ]]; then
   echo "Skipping Tau-Bench run (already finished)."
@@ -387,7 +329,7 @@ python run.py \
   --user-strategy llm \
   --temperature 0.6 \
   --start-index "$START_INDEX" \
-  --end-index "${END_INDEX:--1}" \
+  --end-index "$END_INDEX" \
   --max-concurrency 1 \
   --num-trials "$NUM_TRIALS_VAL" \
   --log-dir "$RESULTS_SUBDIR" \

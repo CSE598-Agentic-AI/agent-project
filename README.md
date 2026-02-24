@@ -326,6 +326,19 @@ sbatch tau-experiment.sh retail fc Qwen/Qwen3-32B-Instruct-2507 5     # 119
 3. Assistant model ID
 4. `num_trials`
 
+**Optional task range** (`--start-index`, `--end-index`): pass these before other arguments to limit which tasks run. Defaults: `0` and `-1` (all tasks).
+
+```bash
+# Run tasks 0–49 for retail with act agent
+sbatch tau-experiment.sh --start-index 0 --end-index 50 retail act "Qwen/Qwen3-4B-Instruct-2507"
+
+# Array mode, limit to first 10 tasks per job
+sbatch --array=0-119 tau-experiment.sh --start-index 0 --end-index 10
+
+# Omit both (defaults: start 0, end -1)
+sbatch tau-experiment.sh retail act "Qwen/Qwen3-4B-Instruct-2507"
+```
+
 ---
 
 ### Resuming after job timeout

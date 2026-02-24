@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-ROOT_DIR="${HOME}/agent-project"
+ROOT_DIR="/scratch/baspinal/agent-project"
 LOG_DIR="${ROOT_DIR}/logs"
 ERROR_DIR="${ROOT_DIR}/errors"
 mkdir -p "${LOG_DIR}" "${ERROR_DIR}"

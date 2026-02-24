@@ -1,6 +1,6 @@
 h#!/bin/bash
 
-cd ~/agent-project
+cd /scratch/baspinal/agent-project
 
 set -euo pipefail
 
