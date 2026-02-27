@@ -88,3 +88,7 @@ class RunConfig(BaseModel):
     shuffle: int = 0
     user_strategy: str = "llm"
     few_shot_displays_path: Optional[str] = None
+    # LLM Sentinel (multi-agent): when set, use LLMSentinel instead of rule-based PolicySentinel
+    sentinel_api_base: Optional[str] = None
+    sentinel_model: Optional[str] = None
+    sentinel_provider: str = "openai"
