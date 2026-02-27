@@ -3,7 +3,6 @@
 #SBATCH -p gaudi
 #SBATCH -q class_gaudi
 #SBATCH -A class_cse59827694spring2026
-#SBATCH --gres=gpu:hl225:1
 #SBATCH -c 12
 #SBATCH --mem=40G
 #SBATCH -t 6:00:00
