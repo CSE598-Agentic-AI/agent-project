@@ -50,10 +50,17 @@ echo "Using USER_MODEL_API_BASE=${USER_MODEL_API_BASE}"
 echo
 
 #########################################
+# SENTINEL for multi-agent (LLM Sentinel)
+#########################################
+# For multi-agent: if SENTINEL_MODEL_API_BASE is unset, we default to the Assistant
+# server (same model) after it starts. To use a separate Sentinel server instead,
+# set: export SENTINEL_MODEL_API_BASE="http://<node>:8008/v1"
+
+#########################################
 # EXPERIMENT GRID (for array mode)
 #########################################
 ENVS=(airline retail)
-AGENTS=(act react fc)
+AGENTS=(act react fc multi-agent)
 MODELS=(
   "Qwen/Qwen3-4B-Instruct-2507"
   "Qwen/Qwen3-8B-Instruct-2507"
@@ -66,7 +73,7 @@ NUM_ENVS=${#ENVS[@]}       # 2
 NUM_AGENTS=${#AGENTS[@]}  # 3
 NUM_MODELS=${#MODELS[@]}  # 4
 NUM_TRIALS=${#TRIALS[@]}  # 5
-TOTAL=$((NUM_ENVS * NUM_AGENTS * NUM_MODELS * NUM_TRIALS))  # 120
+TOTAL=$((NUM_ENVS * NUM_AGENTS * NUM_MODELS * NUM_TRIALS))  # 160
 
 #########################################
 # ARGUMENT / ARRAY HANDLING
@@ -111,9 +118,9 @@ if [ "${#ARGS[@]}" -ge 3 ]; then
   fi
 
   case "$AGENT_STRAT_INPUT" in
-    act|react|fc) ;;
+    act|react|fc|multi-agent) ;;
     *)
-      echo "Error: agent strategy must be one of: act, react, fc (got '$AGENT_STRAT_INPUT')"
+      echo "Error: agent strategy must be one of: act, react, fc, multi-agent (got '$AGENT_STRAT_INPUT')"
       exit 1
       ;;
   esac
@@ -123,9 +130,9 @@ else
     cat <<EOF
 Usage:
   Single run:
-    sbatch tau-experiment.sh [--start-index N] [--end-index M] <env: retail|airline> <agent: act|react|fc> <assistant_model_id> [num_trials]
+    sbatch tau-experiment.sh [--start-index N] [--end-index M] <env: retail|airline> <agent: act|react|fc|multi-agent> <assistant_model_id> [num_trials]
 
-  Full sweep (job array, 120 experiments):
+  Full sweep (job array, 160 experiments):
     sbatch --array=0-$((TOTAL-1)) tau-experiment.sh [--start-index N] [--end-index M]
 EOF
     exit 1
@@ -172,8 +179,11 @@ case "$AGENT_STRAT_INPUT" in
   fc)
     AGENT_STRAT_CLI="tool-calling"
     ;;
+  multi-agent)
+    AGENT_STRAT_CLI="multi-agent"
+    ;;
   *)
-    echo "Error: agent strategy must be one of: act, react, fc (got '$AGENT_STRAT_INPUT')"
+    echo "Error: agent strategy must be one of: act, react, fc, multi-agent (got '$AGENT_STRAT_INPUT')"
     exit 1
     ;;
 esac
@@ -247,6 +257,19 @@ echo "USER endpoint is reachable."
 echo
 
 #########################################
+# Quick health check on SENTINEL (only when using explicit remote Sentinel)
+#########################################
+if [[ "$AGENT_STRAT_INPUT" == "multi-agent" ]] && [ -n "${SENTINEL_MODEL_API_BASE:-}" ]; then
+  echo "Checking remote SENTINEL model endpoint health..."
+  if ! curl -s "${SENTINEL_MODEL_API_BASE}/models" > /dev/null; then
+    echo "ERROR: Could not reach SENTINEL_MODEL_API_BASE=${SENTINEL_MODEL_API_BASE}/models"
+    exit 1
+  fi
+  echo "Remote SENTINEL endpoint is reachable."
+  echo
+fi
+
+#########################################
 # START ASSISTANT SERVER (LOCAL)
 #########################################
 
@@ -303,6 +326,12 @@ fi
 #########################################
 export OPENAI_API_BASE="${ASSIST_BASE}"         # assistant (local)
 export OPENAI_API_KEY="EMPTY"
+
+# For multi-agent: use same model for Sentinel (Assistant server) unless explicitly overridden
+if [[ "$AGENT_STRAT_INPUT" == "multi-agent" ]] && [ -z "${SENTINEL_MODEL_API_BASE:-}" ]; then
+  export SENTINEL_MODEL_API_BASE="${ASSIST_BASE}"
+  echo "LLM Sentinel using same model as Assistant (${ASSIST_BASE})"
+fi
 
 #########################################
 # RUN τ-BENCH

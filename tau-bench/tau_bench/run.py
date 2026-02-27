@@ -21,7 +21,7 @@ def run(config: RunConfig) -> List[EnvRunResult]:
     assert config.env in ["retail", "airline"], "Only retail and airline envs are supported"
     assert config.model_provider in provider_list, "Invalid model provider"
     assert config.user_model_provider in provider_list, "Invalid user model provider"
-    assert config.agent_strategy in ["tool-calling", "act", "react", "few-shot"], "Invalid agent strategy"
+    assert config.agent_strategy in ["tool-calling", "act", "react", "few-shot", "multi-agent"], "Invalid agent strategy"
     assert config.task_split in ["train", "test", "dev"], "Invalid task split"
     assert config.user_strategy in [item.value for item in UserStrategy], "Invalid user strategy"
 
@@ -195,6 +195,25 @@ def agent_factory(
             provider=config.model_provider,
             few_shot_displays=few_shot_displays,
             temperature=config.temperature,
+        )
+    elif config.agent_strategy == "multi-agent":
+        from tau_bench.agents.tool_calling_agent import ToolCallingAgent
+        from tau_bench.multi_agent.multi_agent_agent import MultiAgentAgent
+
+        inner = ToolCallingAgent(
+            tools_info=tools_info,
+            wiki=wiki,
+            model=config.model,
+            provider=config.model_provider,
+            temperature=config.temperature,
+        )
+        return MultiAgentAgent(
+            inner_agent=inner,
+            use_sentinel=True,
+            use_verifier=True,
+            sentinel_api_base=config.sentinel_api_base,
+            sentinel_model=config.sentinel_model,
+            sentinel_provider=config.sentinel_provider,
         )
     else:
         raise ValueError(f"Unknown agent strategy: {config.agent_strategy}")

@@ -40,7 +40,7 @@ def parse_args() -> RunConfig:
         "--agent-strategy",
         type=str,
         default="tool-calling",
-        choices=["tool-calling", "act", "react", "few-shot"],
+        choices=["tool-calling", "act", "react", "few-shot", "multi-agent"],
     )
     parser.add_argument(
         "--temperature",
@@ -69,6 +69,18 @@ def parse_args() -> RunConfig:
     parser.add_argument("--shuffle", type=int, default=0)
     parser.add_argument("--user-strategy", type=str, default="llm", choices=[item.value for item in UserStrategy])
     parser.add_argument("--few-shot-displays-path", type=str, help="Path to a jsonlines file containing few shot displays")
+    parser.add_argument(
+        "--sentinel-api-base",
+        type=str,
+        default=None,
+        help="API base URL for LLM Sentinel (e.g. http://node:8008/v1). When set, multi-agent uses LLMSentinel instead of rule-based PolicySentinel.",
+    )
+    parser.add_argument(
+        "--sentinel-model",
+        type=str,
+        default=None,
+        help="Model name for LLM Sentinel (default: same as model id served at sentinel-api-base)",
+    )
     args = parser.parse_args()
     print(args)
     return RunConfig(
@@ -90,6 +102,9 @@ def parse_args() -> RunConfig:
         shuffle=args.shuffle,
         user_strategy=args.user_strategy,
         few_shot_displays_path=args.few_shot_displays_path,
+        sentinel_api_base=os.environ.get("SENTINEL_MODEL_API_BASE") or args.sentinel_api_base,
+        sentinel_model=args.sentinel_model,
+        sentinel_provider="openai",
     )
 
 

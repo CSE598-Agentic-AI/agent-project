@@ -2,7 +2,7 @@
 
 import json
 from litellm import completion
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 from tau_bench.agents.base import Agent
 from tau_bench.envs.base import Env
@@ -24,6 +24,29 @@ class ToolCallingAgent(Agent):
         self.provider = provider
         self.temperature = temperature
 
+    def get_system_content(self, extra: Optional[str] = None) -> str:
+        """System prompt content; override or extend in wrappers (e.g. instruction vault)."""
+        base = self.wiki
+        if extra:
+            return base + "\n\n" + extra
+        return base
+
+    def generate_next_step(
+        self, messages: List[Dict[str, Any]]
+    ) -> Tuple[Dict[str, Any], Action, float]:
+        """Produce next assistant message and parsed action from current messages. Used by multi-agent wrapper."""
+        res = completion(
+            messages=messages,
+            model=self.model,
+            custom_llm_provider=self.provider,
+            tools=self.tools_info,
+            temperature=self.temperature,
+        )
+        next_message = res.choices[0].message.model_dump()
+        cost = res._hidden_params.get("response_cost") or 0.0
+        action = message_to_action(next_message)
+        return next_message, action, cost
+
     def solve(
         self, env: Env, task_index: Optional[int] = None, max_num_steps: int = 30
     ) -> SolveResult:
@@ -33,24 +56,17 @@ class ToolCallingAgent(Agent):
         info = env_reset_res.info.model_dump()
         reward = 0.0
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": self.wiki},
+            {"role": "system", "content": self.get_system_content()},
             {"role": "user", "content": obs},
         ]
         for _ in range(max_num_steps):
-            res = completion(
-                messages=messages,
-                model=self.model,
-                custom_llm_provider=self.provider,
-                tools=self.tools_info,
-                temperature=self.temperature,
-            )
-            next_message = res.choices[0].message.model_dump()
-            total_cost += res._hidden_params["response_cost"] or 0
-            action = message_to_action(next_message)
+            next_message, action, cost = self.generate_next_step(messages)
+            total_cost += cost
             env_response = env.step(action)
             reward = env_response.reward
             info = {**info, **env_response.info.model_dump()}
             if action.name != RESPOND_ACTION_NAME:
+                next_message["tool_calls"] = next_message.get("tool_calls") or []
                 next_message["tool_calls"] = next_message["tool_calls"][:1]
                 messages.extend(
                     [
