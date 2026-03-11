@@ -7,6 +7,7 @@
 #SBATCH -c 12
 #SBATCH --mem=40G
 #SBATCH -t 6:00:00
+#SBATCH --mail-user="baspinal@asu.edu"
 #SBATCH -o logs/%x_%A_%a.out
 #SBATCH -e errors/%x_%A_%a.err
 

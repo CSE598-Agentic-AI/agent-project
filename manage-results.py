@@ -69,3 +69,6 @@ if __name__ == "__main__":
   # evaluator.evaluate_folder()
 
 
+# sbatch tau-experiment.sh --start-index 33 --end-index 46 airline react "Qwen/Qwen3-4B-Instruct-2507"
+# sbatch tau-experiment.sh airline react Qwen/Qwen3-4B-Instruct-2507 4  # 23 ben (In progress)
+# sbatch tau-experiment.sh airline react Qwen/Qwen3-4B-Instruct-2507 5  # 24 ben (In progress)
