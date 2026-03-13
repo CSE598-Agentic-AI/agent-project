@@ -40,6 +40,10 @@ if __name__ == "__main__":
   print(f"Removing error logs from {folder_path}    --------------------------")
   cleaner.run_on_all_files_in_folder(cleaner.remove_error_logs)
   print()
+  
+  print(f"Removing duplicate tasks from {folder_path}    --------------------------")
+  cleaner.run_on_all_files_in_folder(cleaner.remove_duplicate_tasks)
+  print()
 
   # -------------------------------------------------------------------------
   # STEP 2: View progress
@@ -54,7 +58,7 @@ if __name__ == "__main__":
 
   # detailed_progress() gives a per-folder view: task_id -> trials mapping and
   # missing task IDs (useful for resuming failed experiments)
-  progress_viewer.detailed_progress(folder_path)
+  # progress_viewer.detailed_progress(folder_path)
 
   # -------------------------------------------------------------------------
   # STEP 3: Evaluate the results and graph progress

@@ -54,6 +54,62 @@ class Cleaner():
         with open(self.file_path, "w") as f:
             json.dump(data, f, indent=4)
             
+    def remove_duplicate_tasks(self):
+        """
+        Remove duplicate tasks from the current file, where a task is uniquely
+        identified by its (task_id, trial) pair.
+
+        - Keeps the first occurrence of each (task_id, trial) combination.
+        - If 'trial' is missing, treats it as None for the purpose of de-duplication.
+
+        Intended to be used with run_on_all_files_in_folder, e.g.:
+
+            cleaner = Cleaner(model_size, env, strategy, folder_path=...)
+            cleaner.run_on_all_files_in_folder(cleaner.remove_duplicate_tasks)
+        """
+        if not os.path.exists(self.file_path):
+            return
+
+        try:
+            with open(self.file_path, "r") as f:
+                data = json.load(f)
+        except Exception as e:
+            return f"Error reading {self.file_path}: {e}"
+
+        if not isinstance(data, list):
+            return f"Skipping {self.file_path}: JSON root is not a list"
+
+        seen_pairs = set()
+        cleaned_data = []
+        duplicate_count = 0
+
+        for item in data:
+            if not isinstance(item, dict):
+                cleaned_data.append(item)
+                continue
+
+            task_id = item.get("task_id")
+            trial = item.get("trial", None)
+            key = (task_id, trial)
+
+            if key in seen_pairs:
+                duplicate_count += 1
+                continue
+
+            seen_pairs.add(key)
+            cleaned_data.append(item)
+
+        if duplicate_count == 0:
+            return None
+
+        try:
+            with open(self.file_path, "w") as f:
+                json.dump(cleaned_data, f, indent=4)
+        except Exception as e:
+            return f"Error writing {self.file_path}: {e}"
+
+        return f"{self.file_path}: removed {duplicate_count} duplicate task(s)"
+            
     def show_trials_done(file_path: str) -> None:
         """
         Shows which trials for each task in the file are done.
