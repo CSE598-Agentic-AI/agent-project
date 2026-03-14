@@ -3,8 +3,12 @@
 #SBATCH -p gaudi
 #SBATCH -q class_gaudi
 #SBATCH -A class_cse59827694spring2026
+<<<<<<< HEAD
 #SBATCH --gres=gpu:hl225:1
 #SBATCH -c 10
+=======
+#SBATCH -c 12
+>>>>>>> 637ff8b (checkpoint)
 #SBATCH --mem=40G
 #SBATCH -t 8:00:00
 #SBATCH --mail-type=ALL                # Send an e-mail when a job starts, stops, or fails
