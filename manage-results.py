@@ -1,14 +1,3 @@
-"""
-Main entry point for cleaning experiment results and viewing progress.
-
-This script:
-  1. Sorts JSON result files by task_id and trial. Sometimes the files are not sorted correctly because of all the stopping and starting of the experiments.
-  2. Removes failed/errored task entries from the files
-  3. Prints an aggregate completion summary across all envs/strategies for the model
-
-All operations target the results/ folder structure: results/{env}/{strategy}/{model_size}/
-"""
-
 import os
 from progress import ProgressViewer
 from clean import Cleaner
@@ -67,7 +56,7 @@ if __name__ == "__main__":
   else:
     model_size = "4B"
     env = "airline"
-    strategy = "fc"
+    strategy = "react"
     folder_path = os.path.join("results", env, strategy, model_size)
     progress_viewer = ProgressViewer(model_size, env, strategy, folder_path)
     cleaner = Cleaner(model_size, env, strategy, folder_path)
