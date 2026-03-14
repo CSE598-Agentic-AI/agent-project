@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import List
 
 
@@ -54,6 +55,95 @@ class Cleaner():
         with open(self.file_path, "w") as f:
             json.dump(data, f, indent=4)
             
+    def remove_duplicate_tasks(self):
+        """
+        Resolve duplicate (task_id, trial) pairs by renumbering trials and
+        trimming so each task_id has exactly num_trials trials (0, 1, ..., num_trials-1).
+
+        - For a file named num_trials-4.json, each task_id will end up with
+          exactly trials 0, 1, 2, 3. Extra trials (e.g. trial 4, 5, ...) are deleted.
+        - Duplicate trial values (e.g. two records with trial 0) are renamed to
+          new consecutive indices: within each task, indices are sorted by
+          (original trial, list position), then assigned 0, 1, 2, ...
+        - If the filename does not match num_trials-N.json, no trimming is done.
+
+        Intended to be used with run_on_all_files_in_folder, e.g.:
+
+            cleaner = Cleaner(model_size, env, strategy, folder_path=...)
+            cleaner.run_on_all_files_in_folder(cleaner.remove_duplicate_tasks)
+        """
+        if not os.path.exists(self.file_path):
+            return
+
+        try:
+            with open(self.file_path, "r") as f:
+                data = json.load(f)
+        except Exception as e:
+            return f"Error reading {self.file_path}: {e}"
+
+        if not isinstance(data, list):
+            return f"Skipping {self.file_path}: JSON root is not a list"
+
+        # Parse expected number of trials from filename (e.g. num_trials-4.json -> 4)
+        basename = os.path.basename(self.file_path)
+        num_trials_match = re.match(r"num_trials-(\d+)\.json$", basename)
+        num_trials = int(num_trials_match.group(1)) if num_trials_match else None
+
+        # Group indices by task_id
+        task_id_to_indices = {}
+        for i, item in enumerate(data):
+            if not isinstance(item, dict):
+                continue
+            task_id = item.get("task_id")
+            task_id_to_indices.setdefault(task_id, []).append(i)
+
+        # For each task, sort indices by (original trial, index) so we keep first num_trials
+        # by trial order; duplicates (same trial) get consecutive new indices 0, 1, 2, ...
+        index_to_new_trial = {}
+        indices_to_keep = set()
+        for task_id, indices in task_id_to_indices.items():
+            keep_count = min(len(indices), num_trials) if num_trials is not None else len(indices)
+            # Sort by original trial then by list position so ordering is deterministic
+            sorted_indices = sorted(
+                indices,
+                key=lambda idx: (data[idx].get("trial", 0), idx),
+            )
+            for new_trial, idx in enumerate(sorted_indices[:keep_count]):
+                indices_to_keep.add(idx)
+                index_to_new_trial[idx] = new_trial
+
+        # Build new data: keep only allowed indices, in original list order, with trial renumbered
+        new_data = []
+        renumber_count = 0
+        delete_count = len(data) - len(indices_to_keep)
+
+        for i, item in enumerate(data):
+            if i not in indices_to_keep:
+                continue
+            item = dict(item)
+            new_trial = index_to_new_trial[i]
+            if item.get("trial") != new_trial:
+                item["trial"] = new_trial
+                renumber_count += 1
+            new_data.append(item)
+
+        if renumber_count == 0 and delete_count == 0:
+            return None
+
+        try:
+            with open(self.file_path, "w") as f:
+                json.dump(new_data, f, indent=4)
+        except Exception as e:
+            return f"Error writing {self.file_path}: {e}"
+
+        msg = f"{self.file_path}:"
+        if delete_count > 0:
+            msg += f" removed {delete_count} extra trial(s);"
+        if renumber_count > 0:
+            msg += f" renumbered {renumber_count} trial(s)"
+        return msg.rstrip(";").strip()
+            
+            
     def show_trials_done(file_path: str) -> None:
         """
         Shows which trials for each task in the file are done.
@@ -89,6 +179,7 @@ class Cleaner():
                 key=lambda x: (isinstance(x, int), x)
             )
             print(f"  task_id {task_id}: trials = {trials}")
+        
             
     def show_jobs_to_run(rerun_job_indices):
         if rerun_job_indices:

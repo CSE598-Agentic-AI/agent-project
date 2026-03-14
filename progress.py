@@ -193,3 +193,19 @@ class ProgressViewer():
         self.run_on_all_files_in_folder(lambda: self.print_task_trials(group_by_task=True))
         print(f"Printing missing task ids in {self.folder_path} -------------------------")
         self.run_on_all_files_in_folder(self.missing_task_ids)
+        
+        
+        
+    def print_task_ids_and_trials(self):
+        """
+        Prints every task_id and its trial from each num_trials-*.json file in the folder.
+        """
+        file = self.file_path
+        with open(file, "r") as f:
+            data = json.load(f)
+            print(f"\nIn file {file}:")
+        for item in data:
+            task_id = item.get("task_id")
+            trial = item.get("trial", None)
+            print(f"task_id: {task_id}, trial: {trial}")
+            
