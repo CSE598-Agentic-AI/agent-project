@@ -17,48 +17,82 @@ from evaluate import Evaluator
 
 if __name__ == "__main__":
   # -------------------------------------------------------------------------
-  # CONFIGURATION - Edit these to target a specific experiment subset
+  # CONFIGURATION - All folder paths: results/{env}/{strategy}/{model_size}
   # -------------------------------------------------------------------------
-  model_size = "4B"   # Options: "4B", "8B", "14B", "32B"
-  env = "airline"     # Options: "airline" (50 tasks), "retail" (115 tasks)
-  strategy = "react"    # Options: "act", "react", "fc"
-
-  folder_path = f"results/{env}/{strategy}/{model_size}"
-
-  progress_viewer = ProgressViewer(model_size, env, strategy, folder_path)
-  cleaner = Cleaner(model_size, env, strategy, folder_path)
-  evaluator = Evaluator(model_size, env, strategy, folder_path)
-
-  # -------------------------------------------------------------------------
-  # STEP 1: Clean and sort the JSON files in the target folder
-  # -------------------------------------------------------------------------
-  # Sorts entries by (task_id, trial) for consistent ordering
-  print(f"Sorting files in {folder_path}            --------------------------")
-  cleaner.run_on_all_files_in_folder(cleaner.sort_by_task_id)
-
-  # Removes tasks that have error logs (failed runs) from the JSON files
-  print(f"Removing error logs from {folder_path}    --------------------------")
-  cleaner.run_on_all_files_in_folder(cleaner.remove_error_logs)
-  print()
+  ENVS = ["airline", "retail"]
+  STRATEGIES = ["act", "react", "fc"]
+  MODEL_SIZES = ["4B", "8B", "14B", "32B"]
+  ALL_FILES = False
   
-  print(f"Removing duplicate tasks from {folder_path}    --------------------------")
-  cleaner.run_on_all_files_in_folder(cleaner.remove_duplicate_tasks)
-  print()
+  if ALL_FILES:
+    for env in ENVS:
+      for strategy in STRATEGIES:
+        for model_size in MODEL_SIZES[:1]:
+          folder_path = os.path.join("results", env, strategy, model_size)
+          if not os.path.isdir(folder_path):
+            continue
 
-  # -------------------------------------------------------------------------
-  # STEP 2: View progress
-  # -------------------------------------------------------------------------
-  # progress_by_model() prints completion % for ALL strategies (act, react, fc)
-  # across BOTH envs (retail, airline) for this model_size. Expect output like:
-  #   "Counting completed tasks in results/retail/act/4B"
-  #   "num_trials-1.json: X/Y tasks completed (Z%)"
-  #   ... (repeated for each strategy and env)
-  #   "Qwen4B completion: XX.XX%"
-  progress_viewer.progress_by_model()
+          progress_viewer = ProgressViewer(model_size, env, strategy, folder_path)
+          cleaner = Cleaner(model_size, env, strategy, folder_path)
+          evaluator = Evaluator(model_size, env, strategy, folder_path)
+          
+          # -------------------------------------------------------------------------
+          # STEP 1: Clean and sort the JSON files in every target folder
+          # -------------------------------------------------------------------------
+          # Removes tasks that have error logs (failed runs) from the JSON files
+          print(f"Removing error logs from {folder_path}    --------------------------")
+          cleaner.run_on_all_files_in_folder(cleaner.remove_error_logs)
+          
+          # Removes duplicate tasks from the JSON files
+          print(f"Removing duplicate tasks from {folder_path}    --------------------------")
+          cleaner.run_on_all_files_in_folder(cleaner.remove_duplicate_tasks)
 
-  # detailed_progress() gives a per-folder view: task_id -> trials mapping and
-  # missing task IDs (useful for resuming failed experiments)
-  # progress_viewer.detailed_progress(folder_path)
+          # Sorts entries by (task_id, trial) for consistent ordering
+          print(f"Sorting files in {folder_path}            --------------------------")
+          cleaner.run_on_all_files_in_folder(cleaner.sort_by_task_id)
+          print()
+          
+          
+    
+    # -------------------------------------------------------------------------
+    # STEP 2: View progress
+    # -------------------------------------------------------------------------
+    # progress_by_model() prints completion % for ALL strategies (act, react, fc)
+    # across BOTH envs (retail, airline) for this model_size.
+    for model_size in MODEL_SIZES[:1]:
+      progress_viewer = ProgressViewer(model_size, ENVS[0], STRATEGIES[0], None)
+      progress_viewer.progress_by_model()
+      
+
+  else:
+    model_size = "4B"
+    env = "airline"
+    strategy = "fc"
+    folder_path = os.path.join("results", env, strategy, model_size)
+    progress_viewer = ProgressViewer(model_size, env, strategy, folder_path)
+    cleaner = Cleaner(model_size, env, strategy, folder_path)
+    evaluator = Evaluator(model_size, env, strategy, folder_path)
+    
+    print(f"Removing error logs from {folder_path}    --------------------------")
+    cleaner.run_on_all_files_in_folder(cleaner.remove_error_logs)
+    
+    # Removes duplicate tasks from the JSON files
+    print(f"Removing duplicate tasks from {folder_path}    --------------------------")
+    cleaner.run_on_all_files_in_folder(cleaner.remove_duplicate_tasks)
+
+    # Sorts entries by (task_id, trial) for consistent ordering
+    print(f"Sorting files in {folder_path}            --------------------------")
+    cleaner.run_on_all_files_in_folder(cleaner.sort_by_task_id)
+    
+    print(f"Printing progress for {folder_path}    --------------------------")
+    progress_viewer.progress_by_model()
+    print()
+    
+    print(f"Printing detailed progress for {folder_path}    --------------------------")
+    progress_viewer.detailed_progress(folder_path)
+    print()
+    
+
 
   # -------------------------------------------------------------------------
   # STEP 3: Evaluate the results and graph progress
@@ -72,7 +106,3 @@ if __name__ == "__main__":
   # print(f"Evaluating results in {folder_path}            --------------------------")
   # evaluator.evaluate_folder()
 
-
-# sbatch tau-experiment.sh --start-index 33 --end-index 46 airline react "Qwen/Qwen3-4B-Instruct-2507"
-# sbatch tau-experiment.sh airline react Qwen/Qwen3-4B-Instruct-2507 4  # 23 ben (In progress)
-# sbatch tau-experiment.sh airline react Qwen/Qwen3-4B-Instruct-2507 5  # 24 ben (In progress)

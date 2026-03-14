@@ -33,6 +33,7 @@ VLLM_ARGS=(
   "$MODEL_ID"
   --tensor-parallel-size 1
   --port "$PORT"
+  --max-model-len 16384
 )
 
 #########################################
