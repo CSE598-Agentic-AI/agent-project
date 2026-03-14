@@ -4,9 +4,10 @@
 #SBATCH -q class_gaudi
 #SBATCH -A class_cse59827694spring2026
 #SBATCH --gres=gpu:hl225:1
-#SBATCH -c 12
+#SBATCH -c 10
 #SBATCH --mem=40G
-#SBATCH -t 6:00:00
+#SBATCH -t 8:00:00
+#SBATCH --mail-type=ALL                # Send an e-mail when a job starts, stops, or fails
 #SBATCH --mail-user="baspinal@asu.edu"
 #SBATCH -o logs/%x_%A_%a.out
 #SBATCH -e errors/%x_%A_%a.err

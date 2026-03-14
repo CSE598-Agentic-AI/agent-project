@@ -1,34 +1,54 @@
-h#!/bin/bash
-
-cd /scratch/baspinal/agent-project
+#!/bin/bash
+#SBATCH -J user_vllm
+#SBATCH -p gaudi
+#SBATCH -q class_gaudi
+#SBATCH -A class_cse59827694spring2026
+#SBATCH --gres=gpu:hl225:1
+#SBATCH -c 12
+#SBATCH --mem=40G
+#SBATCH -t 8:00:00
+#SBATCH --mail-type=ALL                # Send an e-mail when a job starts, stops, or fails
+#SBATCH --mail-user="baspinal@asu.edu"
+#SBATCH -o logs/user_vllm_%j.out
+#SBATCH -e errors/user_vllm_%j.err
 
 set -euo pipefail
 
-if [ "$#" -lt 2 ]; then
-  echo "Usage: ./user-server.sh <model-id> <port>"
-  exit 1
-fi
+ROOT_DIR="/scratch/baspinal/agent-project"
+LOG_DIR="${ROOT_DIR}/logs"
+ERROR_DIR="${ROOT_DIR}/errors"
+mkdir -p "${LOG_DIR}" "${ERROR_DIR}"
+cd "${ROOT_DIR}"
+PORT=8007
 
-MODEL_ID="$1"
-PORT="$2"
+module load mamba/latest
+source activate gaudi-pytorch-vllm
 
-#########################################
-# HUGGING FACE AUTH (REQUIRED)
-#########################################
-if [ -f "$HOME/.hf_token" ]; then
-  export HF_TOKEN="$(cat "$HOME/.hf_token")"
-  export HUGGINGFACE_HUB_TOKEN="$HF_TOKEN"
-else
-  echo "ERROR: ~/.hf_token not found."
-  echo "Create it with your Hugging Face token (chmod 600 ~/.hf_token)."
-  exit 1
-fi
 
-echo "Starting USER vLLM server..."
-echo "  Model: $MODEL_ID"
-echo "  Port : $PORT"
+export NO_AI_TRACKING=true
+export VLLM_BUILD="0.0.0.0"
+
+
+
+USER_MODEL="Qwen/Qwen3-32B"
+
+
+echo "===================================="
+echo "Starting USER vLLM server on node: $(hostname)"
+echo "User model:        ${USER_MODEL}"
+echo "User server base:  http://$(hostname):${PORT}/v1"
+echo "===================================="
 echo
 
-vllm serve "$MODEL_ID" \
-  --tensor-parallel-size 1 \
-  --port "$PORT"
+echo "DEBUG: SLURM job on node $(hostname)"
+echo "DEBUG: SLURM_JOB_ID=${SLURM_JOB_ID:-}"
+echo "DEBUG: GRES: ${SLURM_JOB_GRES:-<unset>}"
+
+echo "DEBUG: HABANA_VISIBLE_DEVICES=${HABANA_VISIBLE_DEVICES:-<unset>}"
+
+echo "DEBUG: hl-smi output:"
+hl-smi || echo "hl-smi failed (no HPU visible?)"
+
+
+# IMPORTANT: user-server.sh must NOT re-activate another env
+./user-server.sh "$USER_MODEL" "$PORT"
