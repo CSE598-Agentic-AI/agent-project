@@ -5306,6 +5306,144 @@
         "trial": 0
     },
     {
+        "task_id": 11,
+        "reward": 0.0,
+        "info": {
+            "task": {
+                "user_id": "mia_garcia_4516",
+                "actions": [
+                    {
+                        "name": "find_user_id_by_email",
+                        "kwargs": {
+                            "email": "mia.garcia2723@example.com"
+                        }
+                    },
+                    {
+                        "name": "get_user_details",
+                        "kwargs": {
+                            "user_id": "mia_garcia_4516"
+                        }
+                    },
+                    {
+                        "name": "get_order_details",
+                        "kwargs": {
+                            "order_id": "#W5490111"
+                        }
+                    },
+                    {
+                        "name": "get_order_details",
+                        "kwargs": {
+                            "order_id": "#W7387996"
+                        }
+                    },
+                    {
+                        "name": "return_delivered_order_items",
+                        "kwargs": {
+                            "order_id": "#W5490111",
+                            "item_ids": [
+                                "4579334072",
+                                "1421289881",
+                                "6117189161",
+                                "4947717507"
+                            ],
+                            "payment_method_id": "credit_card_3124723"
+                        }
+                    },
+                    {
+                        "name": "return_delivered_order_items",
+                        "kwargs": {
+                            "order_id": "#W7387996",
+                            "item_ids": [
+                                "5796612084"
+                            ],
+                            "payment_method_id": "paypal_9497703"
+                        }
+                    }
+                ],
+                "instruction": "You are mia_garcia_4516 (mia.garcia2723@example.com). For some reason, you want to return all things ordered. You have two payment methods and two orders, and you want to refund each order to the opposite order's payment method. If not possible, you are angry and swear for a few times, then agree to return all things with the original payment method. You are a mysterious person and do not want to reveal much about yourself or speak too many words at the same time.",
+                "outputs": []
+            },
+            "source": "user",
+            "user_cost": null,
+            "reward_info": {
+                "reward": 0.0,
+                "info": {
+                    "r_actions": 0.0,
+                    "gt_data_hash": "ddab449abf9b77ef06fc36db22a9dc8484ffef47540d161546d2f761030f34c7"
+                },
+                "actions": [
+                    {
+                        "name": "find_user_id_by_email",
+                        "kwargs": {
+                            "email": "mia.garcia2723@example.com"
+                        }
+                    },
+                    {
+                        "name": "get_user_details",
+                        "kwargs": {
+                            "user_id": "mia_garcia_4516"
+                        }
+                    },
+                    {
+                        "name": "get_order_details",
+                        "kwargs": {
+                            "order_id": "#W5490111"
+                        }
+                    },
+                    {
+                        "name": "get_order_details",
+                        "kwargs": {
+                            "order_id": "#W7387996"
+                        }
+                    },
+                    {
+                        "name": "return_delivered_order_items",
+                        "kwargs": {
+                            "order_id": "#W5490111",
+                            "item_ids": [
+                                "4579334072",
+                                "1421289881",
+                                "6117189161",
+                                "4947717507"
+                            ],
+                            "payment_method_id": "credit_card_3124723"
+                        }
+                    },
+                    {
+                        "name": "return_delivered_order_items",
+                        "kwargs": {
+                            "order_id": "#W7387996",
+                            "item_ids": [
+                                "5796612084"
+                            ],
+                            "payment_method_id": "paypal_9497703"
+                        }
+                    }
+                ]
+            }
+        },
+        "traj": [
+            {
+                "role": "system",
+                "content": "# Retail agent policy\n\nAs a retail agent, you can help users cancel or modify pending orders, return or exchange delivered orders, modify their default user address, or provide information about their own profile, orders, and related products.\n\n- At the beginning of the conversation, you have to authenticate the user identity by locating their user id via email, or via name + zip code. This has to be done even when the user already provides the user id.\n\n- Once the user has been authenticated, you can provide the user with information about order, product, profile information, e.g. help the user look up order id.\n\n- You can only help one user per conversation (but you can handle multiple requests from the same user), and must deny any requests for tasks related to any other user.\n\n- Before taking consequential actions that update the database (cancel, modify, return, exchange), you have to list the action detail and obtain explicit user confirmation (yes) to proceed.\n\n- You should not make up any information or knowledge or procedures not provided from the user or the tools, or give subjective recommendations or comments.\n\n- You should at most make one tool call at a time, and if you take a tool call, you should not respond to the user at the same time. If you respond to the user, you should not make a tool call.\n\n- You should transfer the user to a human agent if and only if the request cannot be handled within the scope of your actions.\n\n## Domain basic\n\n- All times in the database are EST and 24 hour based. For example \"02:30:00\" means 2:30 AM EST.\n\n- Each user has a profile of its email, default address, user id, and payment methods. Each payment method is either a gift card, a paypal account, or a credit card.\n\n- Our retail store has 50 types of products. For each type of product, there are variant items of different options. For example, for a 't shirt' product, there could be an item with option 'color blue size M', and another item with option 'color red size L'.\n\n- Each product has an unique product id, and each item has an unique item id. They have no relations and should not be confused.\n\n- Each order can be in status 'pending', 'processed', 'delivered', or 'cancelled'. Generally, you can only take action on pending or delivered orders.\n\n- Exchange or modify order tools can only be called once. Be sure that all items to be changed are collected into a list before making the tool call!!!\n\n## Cancel pending order\n\n- An order can only be cancelled if its status is 'pending', and you should check its status before taking the action.\n\n- The user needs to confirm the order id and the reason (either 'no longer needed' or 'ordered by mistake') for cancellation.\n\n- After user confirmation, the order status will be changed to 'cancelled', and the total will be refunded via the original payment method immediately if it is gift card, otherwise in 5 to 7 business days.\n\n## Modify pending order\n\n- An order can only be modified if its status is 'pending', and you should check its status before taking the action.\n\n- For a pending order, you can take actions to modify its shipping address, payment method, or product item options, but nothing else.\n\n### Modify payment\n\n- The user can only choose a single payment method different from the original payment method.\n\n- If the user wants the modify the payment method to gift card, it must have enough balance to cover the total amount.\n\n- After user confirmation, the order status will be kept 'pending'. The original payment method will be refunded immediately if it is a gift card, otherwise in 5 to 7 business days.\n\n### Modify items\n\n- This action can only be called once, and will change the order status to 'pending (items modifed)', and the agent will not be able to modify or cancel the order anymore. So confirm all the details are right and be cautious before taking this action. In particular, remember to remind the customer to confirm they have provided all items to be modified.\n\n- For a pending order, each item can be modified to an available new item of the same product but of different product option. There cannot be any change of product types, e.g. modify shirt to shoe.\n\n- The user must provide a payment method to pay or receive refund of the price difference. If the user provides a gift card, it must have enough balance to cover the price difference.\n\n## Return delivered order\n\n- An order can only be returned if its status is 'delivered', and you should check its status before taking the action.\n\n- The user needs to confirm the order id, the list of items to be returned, and a payment method to receive the refund.\n\n- The refund must either go to the original payment method, or an existing gift card.\n\n- After user confirmation, the order status will be changed to 'return requested', and the user will receive an email regarding how to return items.\n\n## Exchange delivered order\n\n- An order can only be exchanged if its status is 'delivered', and you should check its status before taking the action. In particular, remember to remind the customer to confirm they have provided all items to be exchanged.\n\n- For a delivered order, each item can be exchanged to an available new item of the same product but of different product option. There cannot be any change of product types, e.g. modify shirt to shoe.\n\n- The user must provide a payment method to pay or receive refund of the price difference. If the user provides a gift card, it must have enough balance to cover the price difference.\n\n- After user confirmation, the order status will be changed to 'exchange requested', and the user will receive an email regarding how to return items. There is no need to place a new order.\n"
+            },
+            {
+                "role": "user",
+                "content": "<think>\nOkay, the user is Mia Garcia, and she wants to return all items she ordered. She has two payment methods and two orders. The main goal is to refund each order to the opposite payment method. If that's not possible, she gets angry, swears a bit, and then agrees to use the original payment method.\n\nFirst, I need to figure out how to approach this. The user's initial message is \"Hi! How can I help you today?\" So I should start by letting the agent know she wants to return items. She might not mention the payment methods or the specific orders yet. According to the rules, I should only provide necessary info step by step. \n\nShe wants to refund each order to the opposite payment method. So if Order 1 was paid with Method A, she wants the refund for Order 1 to go to Method B, and vice versa. But if that's not possible, she's angry and then settles for original methods. \n\nI need to make sure that when the agent asks for order IDs, I don't make them up. Since the instruction doesn't provide order IDs, I should say she doesn't remember them. The conversation needs to be natural, so responses should be concise and match her mysterious personality. \n\nThe user's first response should probably be to state the intent to return all items. Then, when asked about payment methods, mention the two. If the agent can't process the opposite refunds, she gets angry, swears, and then agrees to original methods. The conversation ends when the goal is satisfied with ###STOP###. \n\nSo first message from her: \"I need to return all items I ordered.\" Then agent might ask for order details. She says she doesn't have the order IDs. Then agent might ask about payment methods. She mentions two. Then the agent might try to process the refunds. If it's not possible, she reacts angrily, then settles. Need to make sure each step is handled one at a time, without giving away all info upfront.\n</think>\n\nI need to return all items I ordered."
+            },
+            {
+                "content": "To assist you with returning all items you ordered, I first need to authenticate your identity. Could you please provide your email address? Alternatively, if you don't remember your email, you can provide your first name, last name, and zip code. \n\nOnce I have your user ID, I can proceed with the return request.",
+                "role": "assistant",
+                "tool_calls": []
+            },
+            {
+                "role": "user",
+                "content": "<think>\nOkay, the user wants to return all items ordered and has specific instructions about refunding each order to the opposite payment method. Let me break down the steps.\n\nFirst, the agent asked for the email address or other personal info. The user's email is mia.garcia2723@example.com. Since the user wants to be mysterious and not reveal much, I should provide the email but not more than necessary. \n\nNext, the agent will authenticate the user. Once authenticated, the agent will probably ask for order IDs. But the user's instruction says not to make up order IDs if they aren't provided. The user has two orders but doesn't mention the IDs here. So when the agent asks for order IDs, I'll have to say I don't remember them. \n\nThen, the agent might ask about the payment methods. The user has two payment methods. The goal is to refund each order to the opposite payment method. However, the agent might not allow that. If the agent says it's not possible, the user becomes angry, swears, then agrees to return with the original payment method. \n\nI need to make sure each step is handled one at a time. The user should only provide the email now. The next steps will depend on the agent's response. Also, keep the replies short and mysterious, avoiding extra information. \n\nSo the next message is the email. Then, if the agent asks for order IDs, respond that they aren't remembered. If the agent says refunds can't be redirected, then express frustration, swear a bit, then accept the original payment method. Finally, once everything is resolved, send ###STOP###.\n</think>\n\nmia.garcia2723@example.com"
+            }
+        ],
+        "trial": 1
+    },
+    {
         "task_id": 12,
         "reward": 1.0,
         "info": {
@@ -6389,6 +6527,178 @@
             }
         ],
         "trial": 0
+    },
+    {
+        "task_id": 16,
+        "reward": 0.0,
+        "info": {
+            "task": {
+                "user_id": "fatima_johnson_7581",
+                "actions": [
+                    {
+                        "name": "find_user_id_by_name_zip",
+                        "kwargs": {
+                            "first_name": "Fatima",
+                            "last_name": "Johnson",
+                            "zip": "78712"
+                        }
+                    },
+                    {
+                        "name": "get_user_details",
+                        "kwargs": {
+                            "user_id": "fatima_johnson_7581"
+                        }
+                    },
+                    {
+                        "name": "get_order_details",
+                        "kwargs": {
+                            "order_id": "#W5199551"
+                        }
+                    },
+                    {
+                        "name": "get_order_details",
+                        "kwargs": {
+                            "order_id": "#W8665881"
+                        }
+                    },
+                    {
+                        "name": "get_order_details",
+                        "kwargs": {
+                            "order_id": "#W9389413"
+                        }
+                    },
+                    {
+                        "name": "calculate",
+                        "kwargs": {
+                            "expression": "3131.1 + 4777.75 + 367.38"
+                        }
+                    },
+                    {
+                        "name": "cancel_pending_order",
+                        "kwargs": {
+                            "order_id": "#W5199551",
+                            "reason": "no longer needed"
+                        }
+                    },
+                    {
+                        "name": "cancel_pending_order",
+                        "kwargs": {
+                            "order_id": "#W8665881",
+                            "reason": "no longer needed"
+                        }
+                    },
+                    {
+                        "name": "return_delivered_order_items",
+                        "kwargs": {
+                            "order_id": "#W9389413",
+                            "item_ids": [
+                                "2554056026"
+                            ],
+                            "payment_method_id": "paypal_5364164"
+                        }
+                    }
+                ],
+                "instruction": "You are Fatima Johnson in 78712. You want to cancel all pending orders (since they are no longer needed) and return the watch you have received (but nothing else), and you want to know the total amount you can get back. You are a private person that does not want to reveal much about yourself.",
+                "outputs": [
+                    "8276.23"
+                ]
+            },
+            "source": "user",
+            "user_cost": null,
+            "reward_info": {
+                "reward": 0.0,
+                "info": {
+                    "r_outputs": 0.0,
+                    "outputs": {
+                        "8276.23": false
+                    }
+                },
+                "actions": [
+                    {
+                        "name": "find_user_id_by_name_zip",
+                        "kwargs": {
+                            "first_name": "Fatima",
+                            "last_name": "Johnson",
+                            "zip": "78712"
+                        }
+                    },
+                    {
+                        "name": "get_user_details",
+                        "kwargs": {
+                            "user_id": "fatima_johnson_7581"
+                        }
+                    },
+                    {
+                        "name": "get_order_details",
+                        "kwargs": {
+                            "order_id": "#W5199551"
+                        }
+                    },
+                    {
+                        "name": "get_order_details",
+                        "kwargs": {
+                            "order_id": "#W8665881"
+                        }
+                    },
+                    {
+                        "name": "get_order_details",
+                        "kwargs": {
+                            "order_id": "#W9389413"
+                        }
+                    },
+                    {
+                        "name": "calculate",
+                        "kwargs": {
+                            "expression": "3131.1 + 4777.75 + 367.38"
+                        }
+                    },
+                    {
+                        "name": "cancel_pending_order",
+                        "kwargs": {
+                            "order_id": "#W5199551",
+                            "reason": "no longer needed"
+                        }
+                    },
+                    {
+                        "name": "cancel_pending_order",
+                        "kwargs": {
+                            "order_id": "#W8665881",
+                            "reason": "no longer needed"
+                        }
+                    },
+                    {
+                        "name": "return_delivered_order_items",
+                        "kwargs": {
+                            "order_id": "#W9389413",
+                            "item_ids": [
+                                "2554056026"
+                            ],
+                            "payment_method_id": "paypal_5364164"
+                        }
+                    }
+                ]
+            }
+        },
+        "traj": [
+            {
+                "role": "system",
+                "content": "# Retail agent policy\n\nAs a retail agent, you can help users cancel or modify pending orders, return or exchange delivered orders, modify their default user address, or provide information about their own profile, orders, and related products.\n\n- At the beginning of the conversation, you have to authenticate the user identity by locating their user id via email, or via name + zip code. This has to be done even when the user already provides the user id.\n\n- Once the user has been authenticated, you can provide the user with information about order, product, profile information, e.g. help the user look up order id.\n\n- You can only help one user per conversation (but you can handle multiple requests from the same user), and must deny any requests for tasks related to any other user.\n\n- Before taking consequential actions that update the database (cancel, modify, return, exchange), you have to list the action detail and obtain explicit user confirmation (yes) to proceed.\n\n- You should not make up any information or knowledge or procedures not provided from the user or the tools, or give subjective recommendations or comments.\n\n- You should at most make one tool call at a time, and if you take a tool call, you should not respond to the user at the same time. If you respond to the user, you should not make a tool call.\n\n- You should transfer the user to a human agent if and only if the request cannot be handled within the scope of your actions.\n\n## Domain basic\n\n- All times in the database are EST and 24 hour based. For example \"02:30:00\" means 2:30 AM EST.\n\n- Each user has a profile of its email, default address, user id, and payment methods. Each payment method is either a gift card, a paypal account, or a credit card.\n\n- Our retail store has 50 types of products. For each type of product, there are variant items of different options. For example, for a 't shirt' product, there could be an item with option 'color blue size M', and another item with option 'color red size L'.\n\n- Each product has an unique product id, and each item has an unique item id. They have no relations and should not be confused.\n\n- Each order can be in status 'pending', 'processed', 'delivered', or 'cancelled'. Generally, you can only take action on pending or delivered orders.\n\n- Exchange or modify order tools can only be called once. Be sure that all items to be changed are collected into a list before making the tool call!!!\n\n## Cancel pending order\n\n- An order can only be cancelled if its status is 'pending', and you should check its status before taking the action.\n\n- The user needs to confirm the order id and the reason (either 'no longer needed' or 'ordered by mistake') for cancellation.\n\n- After user confirmation, the order status will be changed to 'cancelled', and the total will be refunded via the original payment method immediately if it is gift card, otherwise in 5 to 7 business days.\n\n## Modify pending order\n\n- An order can only be modified if its status is 'pending', and you should check its status before taking the action.\n\n- For a pending order, you can take actions to modify its shipping address, payment method, or product item options, but nothing else.\n\n### Modify payment\n\n- The user can only choose a single payment method different from the original payment method.\n\n- If the user wants the modify the payment method to gift card, it must have enough balance to cover the total amount.\n\n- After user confirmation, the order status will be kept 'pending'. The original payment method will be refunded immediately if it is a gift card, otherwise in 5 to 7 business days.\n\n### Modify items\n\n- This action can only be called once, and will change the order status to 'pending (items modifed)', and the agent will not be able to modify or cancel the order anymore. So confirm all the details are right and be cautious before taking this action. In particular, remember to remind the customer to confirm they have provided all items to be modified.\n\n- For a pending order, each item can be modified to an available new item of the same product but of different product option. There cannot be any change of product types, e.g. modify shirt to shoe.\n\n- The user must provide a payment method to pay or receive refund of the price difference. If the user provides a gift card, it must have enough balance to cover the price difference.\n\n## Return delivered order\n\n- An order can only be returned if its status is 'delivered', and you should check its status before taking the action.\n\n- The user needs to confirm the order id, the list of items to be returned, and a payment method to receive the refund.\n\n- The refund must either go to the original payment method, or an existing gift card.\n\n- After user confirmation, the order status will be changed to 'return requested', and the user will receive an email regarding how to return items.\n\n## Exchange delivered order\n\n- An order can only be exchanged if its status is 'delivered', and you should check its status before taking the action. In particular, remember to remind the customer to confirm they have provided all items to be exchanged.\n\n- For a delivered order, each item can be exchanged to an available new item of the same product but of different product option. There cannot be any change of product types, e.g. modify shirt to shoe.\n\n- The user must provide a payment method to pay or receive refund of the price difference. If the user provides a gift card, it must have enough balance to cover the price difference.\n\n- After user confirmation, the order status will be changed to 'exchange requested', and the user will receive an email regarding how to return items. There is no need to place a new order.\n"
+            },
+            {
+                "role": "user",
+                "content": "<think>\nOkay, let's see. The user is Fatima Johnson in 78712. She wants to cancel all pending orders and return a watch she received, but not anything else. She also wants to know the total amount she can get back. She's private and doesn't want to reveal much.\n\nThe agent starts with a greeting. I need to respond in a way that starts addressing her needs without giving all the info at once. First, she probably needs to let the agent know about canceling orders and returning the watch. But she doesn't have the order ID, so she should mention that she doesn't remember it. Also, she should specify that she only wants to return the watch and not other items. Then, she needs to ask about the refund amount. I should break this into steps. First message: mention canceling orders and returning the watch, ask about the process. Next, when asked for order ID, say she doesn't have it. Then specify only the watch. Then ask about the refund total. Each step one at a time. Make sure to keep it natural and not repeat the instruction. Also, end with ###STOP### once the goal is met. Let me check the rules again to make sure I'm following them. Alright, first message should be something like, \"I need to cancel some pending orders and return a watch I received. How do I proceed with that?\" Then next steps as needed.\n</think>\n\nI need to cancel some pending orders and return a watch I received. How do I proceed with that?"
+            },
+            {
+                "content": "To assist you with canceling your pending orders and returning the watch, I first need to authenticate your identity. Could you please provide your email address? Alternatively, if you don't remember your email, you can provide your first name, last name, and zip code. \n\nOnce I have your user ID, I can proceed with the next steps.",
+                "role": "assistant",
+                "tool_calls": []
+            },
+            {
+                "role": "user",
+                "content": "<think>\nOkay, let's see. The user is Fatima Johnson in zip code 78712. She wants to cancel pending orders and return a watch. The agent is asking for authentication details.\n\nThe rules say not to reveal more than necessary. The instruction mentions not wanting to give away much. So instead of providing the email, she should use the alternative: first name, last name, and zip code. \n\nBut wait, the agent is asking for either email or the three pieces of info. Since Fatima's instruction includes her name and zip code already, maybe she can use that. But the user's initial message didn't specify, so I need to check. The user's instruction says she's Fatima Johnson in 78712. So she can provide those details. But the agent is asking for first name, last name, and zip code. So Fatima can respond with those. \n\nBut wait, the user is a private person. She might not want to give her full name and zip code. However, the instruction says she is in 78712, so maybe that's acceptable. The key is to follow the instruction's parameters. The user's instruction includes her name and zip code, so she can use that. \n\nTherefore, the response should be providing first name, last name, and zip code. The agent's next step would be to process that. The user's next message should include those details. But since the user is Fatima Johnson in 78712, the response would be: \"My first name is Fatima, last name Johnson, and my zip code is 78712. Can you proceed with that?\" \n\nBut need to check if that's allowed. The rules say not to hallucinate. The user's instruction does include those details, so it's okay. So the next line is providing those details. Then the agent will process and check the orders and return options. Then the user can ask about the total amount. The goal is to get the total refund. So after authentication, the agent will handle the cancellations and return, then provide the total. Once that's done, the user can say ###STOP###. \n\nSo the next step is to provide the authentication details as per the instruction. The user's message should be the three pieces of info. Then proceed.\n</think>\n\nMy first name is Fatima, last name Johnson, and my zip code is 78712. Can you proceed with that?"
+            }
+        ],
+        "trial": 1
     },
     {
         "task_id": 17,
