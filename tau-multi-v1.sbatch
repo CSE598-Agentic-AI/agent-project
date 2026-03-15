@@ -15,7 +15,7 @@
 #SBATCH --export=NONE   # Purge the job-submitting shell environment
 
 echo "Starting the script..."
-cd /scratch/sdutta60/vllm-test/
+cd /scratch/sdutta60/agent-project/
 
 
 echo "Loading required software..."
@@ -216,7 +216,7 @@ export USER_MODEL_API_BASE=http://localhost:${USER_VLLM_PORT}/v1
 export OPENAI_API_KEY=sk-dummy
 
 # Change to tau-bench directory
-cd /scratch/sdutta60/vllm-test/tau-bench
+cd /scratch/sdutta60/agent-project/tau-bench
 
 # Verify both vLLM servers are still running and healthy
 echo "Verifying both vLLM servers health before starting tau-bench..."

@@ -14,7 +14,7 @@
 #SBATCH --export=NONE   # Purge the job-submitting shell environment
 
 echo "Starting the script..."
-cd /scratch/sdutta60/vllm-test/
+cd /scratch/sdutta60/agent-project/
 
 echo "Loading required software..."
 module load mamba/latest
@@ -55,7 +55,7 @@ echo "  Num. trials   : $NUM_TRIALS"
 echo "  API Base      : $OPENAI_API_BASE"
 echo "  Log file      : $TAUBENCH_LOG"
 
-cd /scratch/sdutta60/vllm-test/tau-bench
+cd /scratch/sdutta60/agent-project/tau-bench
 
 echo "Running tau-bench..."
 python run.py \
