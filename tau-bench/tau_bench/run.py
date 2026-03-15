@@ -21,22 +21,15 @@ def run(config: RunConfig) -> List[EnvRunResult]:
     assert config.env in ["retail", "airline"], "Only retail and airline envs are supported"
     assert config.model_provider in provider_list, "Invalid model provider"
     assert config.user_model_provider in provider_list, "Invalid user model provider"
-    assert config.agent_strategy in ["tool-calling", "act", "react", "few-shot"], "Invalid agent strategy"
+    assert config.agent_strategy in ["tool-calling", "act", "react", "few-shot", "multi-agent-v1"], "Invalid agent strategy"
     assert config.task_split in ["train", "test", "dev"], "Invalid task split"
     assert config.user_strategy in [item.value for item in UserStrategy], "Invalid user strategy"
 
     random.seed(config.seed)
     time_str = datetime.now().strftime("%m%d%H%M%S")
-
-    ckpt_path = (
-        f"{config.log_dir}/num_trials-{config.num_trials}.json"
-    )
-
-    # Ensure the log directory and the checkpoint directory both exist.
-    # This fixes FileNotFoundError when ckpt_path contains slashes from model names,
-    # e.g. user model "Qwen/Qwen3-32B" -> "..._user-Qwen/Qwen3-32B-...json"
-    os.makedirs(config.log_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+    ckpt_path = f"{config.log_dir}/{config.agent_strategy}-{config.model.split('/')[-1]}-{config.temperature}_range_{config.start_index}-{config.end_index}_user-{config.user_model.split('/')[-1]}-{config.user_strategy}_{time_str}.json"
+    if not os.path.exists(config.log_dir):
+        os.makedirs(config.log_dir)
 
     print(f"Loading user with strategy: {config.user_strategy}")
     env = get_env(
@@ -61,7 +54,7 @@ def run(config: RunConfig) -> List[EnvRunResult]:
     else:
         print(
             f"Running tasks {config.start_index} to {end_index} (checkpoint path: {ckpt_path})"
-        )
+    )
     for i in range(config.num_trials):
         if config.task_ids and len(config.task_ids) > 0:
             idxs = config.task_ids
@@ -112,8 +105,6 @@ def run(config: RunConfig) -> List[EnvRunResult]:
                 if os.path.exists(ckpt_path):
                     with open(ckpt_path, "r") as f:
                         data = json.load(f)
-                # Directory should already exist from above, but this is idempotent.
-                os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
                 with open(ckpt_path, "w") as f:
                     json.dump(data + [result.model_dump()], f, indent=2)
             return result
@@ -124,22 +115,8 @@ def run(config: RunConfig) -> List[EnvRunResult]:
 
     display_metrics(results)
 
-    # Final write: merge with existing checkpoint so partial re-runs (e.g. error resume)
-    # do not wipe out results for tasks outside this run's range.
-    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-    run_task_ids = {r.task_id for r in results}
-
-    existing: List[Dict[str, Any]] = []
-    if os.path.exists(ckpt_path):
-        with open(ckpt_path, "r") as f:
-            existing = json.load(f)
-    # Keep existing entries whose task_id is not in the range we just ran
-    merged = [e for e in existing if e.get("task_id") not in run_task_ids]
-    # Add all results from this run (replacing any prior entries for those task_ids)
-    merged.extend(result.model_dump() for result in results)
-    merged.sort(key=lambda e: (e.get("task_id", 0), e.get("trial", 0)))
     with open(ckpt_path, "w") as f:
-        json.dump(merged, f, indent=2)
+        json.dump([result.model_dump() for result in results], f, indent=2)
         print(f"\n📄 Results saved to {ckpt_path}\n")
     return results
 
@@ -196,6 +173,21 @@ def agent_factory(
             few_shot_displays=few_shot_displays,
             temperature=config.temperature,
         )
+    elif config.agent_strategy == "multi-agent-v1":
+        from tau_bench.agents.multi_agent_v1 import MultiAgentV1
+
+        return MultiAgentV1(
+            tools_info=tools_info,
+            wiki=wiki,
+            model=config.model,
+            provider=config.model_provider,
+            temperature=config.temperature,
+            planner_model=config.planner_model,
+            planner_provider=config.planner_provider,
+            critic_model=config.critic_model,
+            critic_provider=config.critic_provider,
+            max_critic_retries=config.max_critic_retries,
+        )
     else:
         raise ValueError(f"Unknown agent strategy: {config.agent_strategy}")
 
@@ -206,7 +198,7 @@ def display_metrics(results: List[EnvRunResult]) -> None:
 
     num_trials = len(set([r.trial for r in results]))
     rewards = [r.reward for r in results]
-    avg_reward = sum(rewards) / len(rewards) if len(rewards) > 0 else 0
+    avg_reward = sum(rewards) / len(rewards)
     # c from https://arxiv.org/pdf/2406.12045
     c_per_task_id: dict[int, int] = {}
     for result in results:
