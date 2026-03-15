@@ -14,7 +14,7 @@
 #SBATCH --export=NONE   # Purge the job-submitting shell environment
 
 echo "Starting the script..."
-cd /scratch/sdutta60/agent-project/
+cd /scratch/sdutta60/agent-project/tau-bench
 
 echo "Loading required software..."
 module load mamba/latest
@@ -23,6 +23,8 @@ echo "Activating tau-bench environment..."
 source activate tau-scratch-v1
 
 # ===== API CONFIGURATION (from .env) =====
+
+
 export OPENAI_API_BASE=https://openai.rc.asu.edu/v1
 export OPENAI_API_KEY=sk-xxxx
 export AGENT_MODEL_API_BASE=https://openai.rc.asu.edu/v1

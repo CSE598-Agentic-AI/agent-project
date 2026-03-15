@@ -15,12 +15,13 @@
 #SBATCH --export=NONE   # Purge the job-submitting shell environment
 
 echo "Starting the script..."
-cd /scratch/sdutta60/agent-project/
+cd /scratch/sdutta60/agent-project/tau-bench
 
 
 echo "Loading required software..."
 #Load required software
 module load mamba/latest
+pip install -e .
 
 # echo "Loading CUDA..."
 # module load cuda-12.6.1-gcc-12.1.0
