@@ -45,11 +45,13 @@ class LLMUserSimulationEnv(BaseUserSimulationEnv):
 
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
         api_base = os.getenv('USER_MODEL_API_BASE', None)
+        api_key = os.getenv('USER_MODEL_API_KEY', None)
         res = completion(
-            model=self.model, 
-            custom_llm_provider=self.provider, 
+            model=self.model,
+            custom_llm_provider=self.provider,
             messages=messages,
-            api_base=api_base
+            api_base=api_base,
+            api_key=api_key,
         )
 
         message = res.choices[0].message
