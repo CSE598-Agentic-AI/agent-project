@@ -31,6 +31,23 @@ class ToolCallingAgent(Agent):
             return base + "\n\n" + extra
         return base
 
+    def get_tool_result_message(
+        self, observation: str, next_message: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Return message(s) to append after a tool call (OpenAI tool-role format)."""
+        tool_calls = next_message.get("tool_calls") or []
+        if not tool_calls:
+            return []
+        tc = tool_calls[0]
+        return [
+            {
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "name": tc["function"]["name"],
+                "content": observation,
+            }
+        ]
+
     def generate_next_step(
         self, messages: List[Dict[str, Any]]
     ) -> Tuple[Dict[str, Any], Action, float]:

@@ -3,6 +3,7 @@
 # before execution (addresses Domain Policy Violations and Contextual Misinterpretation).
 
 import json
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from tau_bench.types import Action, RESPOND_ACTION_NAME
@@ -167,13 +168,11 @@ If NO_GO, you must also provide a short "Correction needed: ..." message explain
     def __init__(
         self,
         rules: List[str],
-        api_base: str,
         model: str = "local",
         provider: str = "openai",
         temperature: float = 0.0,
     ) -> None:
         self.rules = rules
-        self.api_base = api_base.rstrip("/")
         self.model = model
         self.provider = provider
         self.temperature = temperature
@@ -183,10 +182,13 @@ If NO_GO, you must also provide a short "Correction needed: ..." message explain
     ) -> Tuple[bool, str]:
         """
         Check if the proposed action is allowed. Calls the Sentinel LLM API.
+        API base is read from SENTINEL_MODEL_API_BASE or OPENAI_API_BASE (assistant base) at call time.
         Returns (True, "") if allowed, (False, "Correction: ...") if blocked.
         """
         if action.name == RESPOND_ACTION_NAME:
             return True, ""
+
+        api_base = os.getenv("SENTINEL_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
 
         user_content = self._build_prompt(action, env_data, env_name)
         messages = [
@@ -197,13 +199,15 @@ If NO_GO, you must also provide a short "Correction needed: ..." message explain
         try:
             from litellm import completion
 
-            res = completion(
-                model=self.model,
-                messages=messages,
-                api_base=self.api_base,
-                custom_llm_provider=self.provider,
-                temperature=self.temperature,
-            )
+            kwargs = {
+                "model": self.model,
+                "messages": messages,
+                "custom_llm_provider": self.provider,
+                "temperature": self.temperature,
+            }
+            if api_base:
+                kwargs["api_base"] = api_base.rstrip("/")
+            res = completion(**kwargs)
             reply = (res.choices[0].message.content or "").strip().upper()
         except Exception as e:
             # On API failure, allow the action (fail open) to avoid blocking runs

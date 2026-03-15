@@ -88,7 +88,10 @@ class RunConfig(BaseModel):
     shuffle: int = 0
     user_strategy: str = "llm"
     few_shot_displays_path: Optional[str] = None
-    # LLM Sentinel (multi-agent): when set, use LLMSentinel instead of rule-based PolicySentinel
-    sentinel_api_base: Optional[str] = None
+    # LLM Sentinel (multi-agent): API base from SENTINEL_MODEL_API_BASE or OPENAI_API_BASE (env)
     sentinel_model: Optional[str] = None
     sentinel_provider: str = "openai"
+    # FACT agent (multi-agent): API base from FACT_API_BASE or OPENAI_API_BASE (env)
+    use_fact: bool = True
+    fact_model: Optional[str] = None
+    fact_provider: str = "openai"

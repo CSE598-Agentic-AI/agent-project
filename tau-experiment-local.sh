@@ -1,23 +1,16 @@
 #!/bin/bash
-#SBATCH -J tau_experiment
-#SBATCH -p gaudi
-#SBATCH -q class_gaudi
-#SBATCH -A class_cse59827694spring2026
-#SBATCH --gres=gpu:hl225:1
-#SBATCH -c 10
-#SBATCH --mem=40G
-#SBATCH -t 8:00:00
-#SBATCH --mail-type=ALL                # Send an e-mail when a job starts, stops, or fails
-#SBATCH --mail-user="baspinal@asu.edu"
-#SBATCH -o logs/%x_%A_%a.out
-#SBATCH -e errors/%x_%A_%a.err
+# Local version of tau-experiment.sh: run τ-Bench experiments locally (no SLURM).
+# Prereq: Start the USER vLLM server first, e.g. ./user-vllm-job-local.sh (or set USER_MODEL_API_BASE).
+#
+# Single run:
+#   ./tau-experiment-local.sh [--start-index N] [--end-index M] <env> <agent> <assist_model> [num_trials]
+# Example:
+#   export USER_MODEL_API_BASE="http://127.0.0.1:8007/v1"
+#   ./tau-experiment-local.sh airline react Qwen/Qwen3-4B-Instruct-2507 2
 
 set -euo pipefail
 
-#########################################
-# ROOT DIR (this script is designed for)
-#########################################
-ROOT_DIR="/scratch/baspinal/agent-project"
+ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 LOG_DIR="${ROOT_DIR}/logs"
 ERROR_DIR="${ROOT_DIR}/errors"
 BASE_RESULTS_DIR="${ROOT_DIR}/results"
@@ -25,33 +18,14 @@ BASE_RESULTS_DIR="${ROOT_DIR}/results"
 mkdir -p "${LOG_DIR}" "${ERROR_DIR}" "${BASE_RESULTS_DIR}"
 cd "${ROOT_DIR}"
 
-#########################################
-# REQUIRE USER_MODEL_API_BASE (remote)
-#########################################
-if [ -z "${USER_MODEL_API_BASE:-}" ]; then
-  cat <<EOF
-ERROR: USER_MODEL_API_BASE is not set.
-
-You must start the USER vLLM server in a separate job, then set:
-
-  export USER_MODEL_API_BASE="http://<user-node>:8007/v1"
-
-before submitting this script.
-
-EOF
-  exit 1
-fi
+# Default USER model API to localhost if not set
+export USER_MODEL_API_BASE="${USER_MODEL_API_BASE:-http://127.0.0.1:8007/v1}"
 
 echo "Using USER_MODEL_API_BASE=${USER_MODEL_API_BASE}"
 echo
 
 #########################################
-# SENTINEL for multi-agent (LLM Sentinel)
-#########################################
-# For multi-agent: Sentinel always uses the Assistant server (same model).
-
-#########################################
-# EXPERIMENT GRID (for array mode)
+# EXPERIMENT GRID (for array-like runs)
 #########################################
 ENVS=(airline retail)
 AGENTS=(act react fc multi-agent)
@@ -63,21 +37,15 @@ MODELS=(
 )
 TRIALS=(1 2 3 4 5)
 
-NUM_ENVS=${#ENVS[@]}       # 2
-NUM_AGENTS=${#AGENTS[@]}  # 3
-NUM_MODELS=${#MODELS[@]}  # 4
-NUM_TRIALS=${#TRIALS[@]}  # 5
-TOTAL=$((NUM_ENVS * NUM_AGENTS * NUM_MODELS * NUM_TRIALS))  # 160
+NUM_ENVS=${#ENVS[@]}
+NUM_AGENTS=${#AGENTS[@]}
+NUM_MODELS=${#MODELS[@]}
+NUM_TRIALS=${#TRIALS[@]}
+TOTAL=$((NUM_ENVS * NUM_AGENTS * NUM_MODELS * NUM_TRIALS))
 
 #########################################
-# ARGUMENT / ARRAY HANDLING
+# ARGUMENT / OPTIONAL ARRAY INDEX
 #########################################
-# Modes:
-#   1) Single run (CLI): sbatch tau-experiment.sh [--start-index N] [--end-index M] <env> <agent> <assist_model> [num_trials]
-#   2) Array mode:      sbatch --array=0-119 tau-experiment.sh [--start-index N] [--end-index M]
-#########################################
-
-# Parse optional --start-index and --end-index (defaults: 0, -1)
 START_INDEX=0
 END_INDEX=-1
 ARGS=()
@@ -96,7 +64,6 @@ while [[ $i -le $# ]]; do
 done
 
 if [ "${#ARGS[@]}" -ge 3 ]; then
-  # ----- Mode 1: direct arguments (single experiment) -----
   ENV_NAME="${ARGS[0]}"
   AGENT_STRAT_INPUT="${ARGS[1]}"
   ASSIST_MODEL="${ARGS[2]}"
@@ -119,70 +86,30 @@ if [ "${#ARGS[@]}" -ge 3 ]; then
       ;;
   esac
 else
-  # ----- Mode 2: array mode, decode from SLURM_ARRAY_TASK_ID -----
-  if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
-    cat <<EOF
-Usage:
-  Single run:
-    sbatch tau-experiment.sh [--start-index N] [--end-index M] <env: retail|airline> <agent: act|react|fc|multi-agent> <assistant_model_id> [num_trials]
-
-  Full sweep (job array, 160 experiments):
-    sbatch --array=0-$((TOTAL-1)) tau-experiment.sh [--start-index N] [--end-index M]
-EOF
-    exit 1
-  fi
-
-  if [[ "$SLURM_ARRAY_TASK_ID" -ge "$TOTAL" ]]; then
-    echo "Invalid array index ${SLURM_ARRAY_TASK_ID} (max $((TOTAL-1)))"
-    exit 1
-  fi
-
-  IDX=$SLURM_ARRAY_TASK_ID
-
-  # index over TRIALS (fastest varying)
-  TRIAL_IDX=$((IDX % NUM_TRIALS))
-  IDX=$((IDX / NUM_TRIALS))
-
-  # then MODELS
-  MODEL_IDX=$((IDX % NUM_MODELS))
-  IDX=$((IDX / NUM_MODELS))
-
-  # then AGENTS
-  AGENT_IDX=$((IDX % NUM_AGENTS))
-  IDX=$((IDX / NUM_AGENTS))
-
-  # then ENVS
-  ENV_IDX=$((IDX % NUM_ENVS))
-
-  ENV_NAME="${ENVS[$ENV_IDX]}"
-  AGENT_STRAT_INPUT="${AGENTS[$AGENT_IDX]}"
-  ASSIST_MODEL="${MODELS[$MODEL_IDX]}"
-  NUM_TRIALS_VAL="${TRIALS[$TRIAL_IDX]}"
+  echo "Usage:"
+  echo "  Single run: ./tau-experiment-local.sh [--start-index N] [--end-index M] <env: retail|airline> <agent: act|react|fc|multi-agent> <assistant_model_id> [num_trials]"
+  echo ""
+  echo "Example:"
+  echo "  export USER_MODEL_API_BASE=\"http://127.0.0.1:8007/v1\""
+  echo "  ./tau-experiment-local.sh airline react Qwen/Qwen3-4B-Instruct-2507 2"
+  exit 1
 fi
 
 #########################################
 # Map AGENT_STRAT_INPUT -> Tau-Bench CLI
 #########################################
 case "$AGENT_STRAT_INPUT" in
-  act)
-    AGENT_STRAT_CLI="act"
-    ;;
-  react)
-    AGENT_STRAT_CLI="react"
-    ;;
-  fc)
-    AGENT_STRAT_CLI="tool-calling"
-    ;;
-  multi-agent)
-    AGENT_STRAT_CLI="multi-agent"
-    ;;
+  act)    AGENT_STRAT_CLI="act" ;;
+  react)  AGENT_STRAT_CLI="react" ;;
+  fc)     AGENT_STRAT_CLI="tool-calling" ;;
+  multi-agent) AGENT_STRAT_CLI="multi-agent" ;;
   *)
     echo "Error: agent strategy must be one of: act, react, fc, multi-agent (got '$AGENT_STRAT_INPUT')"
     exit 1
     ;;
 esac
 
-USER_MODEL="Qwen/Qwen3-32B"  # logical name for tau-bench; served remotely
+USER_MODEL="Qwen/Qwen3-32B"
 ASSIST_SAFE="${ASSIST_MODEL//\//_}"
 
 #########################################
@@ -197,12 +124,10 @@ case "$ASSIST_MODEL" in
 esac
 
 echo "========================================"
-echo "SLURM_JOB_ID:        ${SLURM_JOB_ID:-N/A}"
-echo "SLURM_ARRAY_TASK_ID: ${SLURM_ARRAY_TASK_ID:-N/A}"
 echo "Environment:         $ENV_NAME"
 echo "Agent strategy:      $AGENT_STRAT_INPUT (CLI: $AGENT_STRAT_CLI)"
 echo "Assistant model:     $ASSIST_MODEL"
-echo "User model (fixed):  $USER_MODEL (remote)"
+echo "User model (fixed):  $USER_MODEL"
 echo "Num trials:          $NUM_TRIALS_VAL"
 echo "Start index:         $START_INDEX"
 echo "End index:           $END_INDEX"
@@ -210,33 +135,20 @@ echo "Model size bucket:   $MODEL_SIZE"
 echo "========================================"
 echo
 
-#########################################
-# RESULTS DIRS (mirror log structure)
-# results/env/agent/modelsize/<assist_safe>_trialsN
-#########################################
 RESULTS_SUBDIR="${BASE_RESULTS_DIR}/${ENV_NAME}/${AGENT_STRAT_INPUT}/${MODEL_SIZE}"
 mkdir -p "${RESULTS_SUBDIR}"
-
-
-echo "Results directory:   $RESULTS_SUBDIR"
-echo
-
-#########################################
-# LOG DIR STRUCTURE: logs/env/agent/modelsize
-#########################################
 LOG_SUBDIR="${LOG_DIR}/${ENV_NAME}/${AGENT_STRAT_INPUT}/${MODEL_SIZE}"
 mkdir -p "${LOG_SUBDIR}"
 
+echo "Results directory:   $RESULTS_SUBDIR"
 echo "Log directory:       ${LOG_SUBDIR}"
 echo
 
-#########################################
-# ACTIVATE ENV (Gaudi vLLM / PyTorch)
-#########################################
-module load mamba/latest
-source activate gaudi-pytorch-vllm
-export NO_AI_TRACKING=true
-export VLLM_BUILD="0.0.0.0"
+export NO_AI_TRACKING="${NO_AI_TRACKING:-true}"
+
+# Uncomment if you use conda/mamba for your vLLM environment:
+# source "$(conda info --base)/etc/profile.d/conda.sh"
+# conda activate your-vllm-env
 
 #########################################
 # Quick health check on USER server
@@ -244,7 +156,7 @@ export VLLM_BUILD="0.0.0.0"
 echo "Checking USER model endpoint health..."
 if ! curl -s "${USER_MODEL_API_BASE}/models" > /dev/null; then
   echo "ERROR: Could not reach USER_MODEL_API_BASE=${USER_MODEL_API_BASE}/models"
-  echo "Make sure the user-vllm job is running and URL is correct."
+  echo "Start the user server first: ./user-vllm-job-local.sh"
   exit 1
 fi
 echo "USER endpoint is reachable."
@@ -253,10 +165,9 @@ echo
 #########################################
 # START ASSISTANT SERVER (LOCAL)
 #########################################
-
-echo "Starting ASSISTANT vLLM on port 8005 (node: $(hostname))..."
-ASSIST_LOG="${LOG_SUBDIR}/assistant-num_trials${NUM_TRIALS_VAL}-job${SLURM_JOB_ID}.log"
-./assistant-server.sh "$ASSIST_MODEL" 8005 "$AGENT_STRAT_CLI" \
+echo "Starting ASSISTANT vLLM on port 8005..."
+ASSIST_LOG="${LOG_SUBDIR}/assistant-num_trials${NUM_TRIALS_VAL}-local.log"
+./assistant-server-local.sh "$ASSIST_MODEL" 8005 "$AGENT_STRAT_CLI" \
   > "${ASSIST_LOG}" 2>&1 &
 ASSIST_PID=$!
 
@@ -264,9 +175,6 @@ echo "Assistant PID: $ASSIST_PID"
 echo "Assistant log: ${ASSIST_LOG}"
 echo
 
-#########################################
-# HELPER: wait until vLLM server is ready
-#########################################
 wait_for_ready() {
   local name="$1"
   local base="$2"
@@ -280,7 +188,6 @@ wait_for_ready() {
       echo "${name} server at ${base} is ready (after ${attempt} attempts)."
       return 0
     fi
-
     echo "  [${name}] not ready yet (attempt ${attempt}/${max_attempts}). Sleeping 5s..."
     sleep 5
     ((attempt++))
@@ -290,9 +197,6 @@ wait_for_ready() {
   return 1
 }
 
-#########################################
-# WAIT FOR ASSISTANT TO BE READY
-#########################################
 ASSIST_BASE="http://127.0.0.1:8005/v1"
 
 if ! wait_for_ready "ASSISTANT" "$ASSIST_BASE"; then
@@ -305,10 +209,9 @@ fi
 #########################################
 # EXPORT ENDPOINTS
 #########################################
-export OPENAI_API_BASE="${ASSIST_BASE}"         # assistant (local)
+export OPENAI_API_BASE="${ASSIST_BASE}"
 export OPENAI_API_KEY="EMPTY"
 
-# For multi-agent: Sentinel and FACT read API base from env (OPENAI_API_BASE = assistant base)
 if [[ "$AGENT_STRAT_INPUT" == "multi-agent" ]]; then
   echo "LLM Sentinel and FACT agent use OPENAI_API_BASE (same as Assistant: ${ASSIST_BASE})"
 fi
@@ -318,38 +221,31 @@ fi
 #########################################
 cd "${ROOT_DIR}/tau-bench"
 
-echo "Running Tau-Bench..."
-echo
-
-
-# Total tasks (test split): retail=115, airline=50 (zero-indexed: 0..114, 0..49)
 case "$ENV_NAME" in
   retail)  TOTAL_TASKS=115 ;;
   airline) TOTAL_TASKS=50 ;;
   *)       TOTAL_TASKS=0 ;;
 esac
 
-
 if [[ "${SKIP_RUN:-0}" -eq 1 ]]; then
   echo "Skipping Tau-Bench run (already finished)."
   TB_EXIT=0
 else
-python run.py \
-  --agent-strategy "$AGENT_STRAT_CLI" \
-  --env "$ENV_NAME" \
-  --model "$ASSIST_MODEL" \
-  --model-provider openai \
-  --user-model "$USER_MODEL" \
-  --user-model-provider openai \
-  --user-strategy llm \
-  --temperature 0.6 \
-  --start-index "$START_INDEX" \
-  --end-index "$END_INDEX" \
-  --max-concurrency 1 \
-  --num-trials "$NUM_TRIALS_VAL" \
-  --log-dir "$RESULTS_SUBDIR" \
-
-TB_EXIT=$?
+  python run.py \
+    --agent-strategy "$AGENT_STRAT_CLI" \
+    --env "$ENV_NAME" \
+    --model "$ASSIST_MODEL" \
+    --model-provider openai \
+    --user-model "$USER_MODEL" \
+    --user-model-provider openai \
+    --user-strategy llm \
+    --temperature 0.6 \
+    --start-index "$START_INDEX" \
+    --end-index "$END_INDEX" \
+    --max-concurrency 1 \
+    --num-trials "$NUM_TRIALS_VAL" \
+    --log-dir "$RESULTS_SUBDIR"
+  TB_EXIT=$?
 fi
 
 #########################################

@@ -34,6 +34,18 @@ class ChatReActAgent(Agent):
         self.use_reasoning = use_reasoning
         self.tools_info = tools_info
 
+    def get_system_content(self, extra: Optional[str] = None) -> str:
+        """System prompt content; wrapper appends Instruction Vault `extra` here."""
+        if extra:
+            return self.prompt + "\n\n" + extra
+        return self.prompt
+
+    def get_tool_result_message(
+        self, observation: str, next_message: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Return message(s) to append after a tool call (ReAct uses user message with API output)."""
+        return [{"role": "user", "content": "API output: " + observation}]
+
     def generate_next_step(
         self, messages: List[Dict[str, Any]]
     ) -> Tuple[Dict[str, Any], Action, float]:
