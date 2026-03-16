@@ -56,7 +56,7 @@ if __name__ == "__main__":
   else:
     model_size = "4B"
     env = "retail"
-    strategy = "react"
+    strategy = "fc"
     folder_path = os.path.join("results", env, strategy, model_size)
     progress_viewer = ProgressViewer(model_size, env, strategy, folder_path)
     cleaner = Cleaner(model_size, env, strategy, folder_path)
