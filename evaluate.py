@@ -28,22 +28,24 @@ class Evaluator():
             data = json.load(f)
 
         # Extract relevant fields for table and plot
+        scores = []
         records = []
         for item in data:
             task_id = item.get('task_id')
             trial = item.get('trial')
             # Try the most common result fields, default to None if not present
             score = item.get('reward', item.get('score', item.get('result', None)))
+            scores.append(score)
             records.append({"task_id": task_id, "trial": trial, "score": score})
 
         # Create DataFrame for table
         df = pd.DataFrame(records)
         df = df.sort_values(by=["task_id", "trial"])
-        print(f"{self.file_path}")
-        print(df.to_string(index=False))
+        # print(f"{self.file_path}")
+        # print(df.to_string(index=False))
 
         # Pivot for heatmap: Rows=task_id, Cols=trial, Values=score
-        print("df: \n", df)
+        # print("df: \n", df)
 
 
         pivot = df.pivot(index='task_id', columns='trial', values='score')
@@ -64,7 +66,13 @@ class Evaluator():
         )
         plt.tight_layout()
         plt.show()
-        return df
+
+        # Calculate the percentage of tasks passed for each trial
+        # Define a "pass" as score > 0 (this can be adjusted if needed)
+
+        return scores
+
+    
 
 
     def evaluate_folder(self):
@@ -73,6 +81,6 @@ class Evaluator():
                 self.set_file_path(os.path.join(self.folder_path, file))
                 result = self.evaluate_file()
                 if result is not None:  
-                    print(result)
+                    print(f"{file}: {result}")
 
 
