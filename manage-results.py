@@ -11,14 +11,14 @@ if __name__ == "__main__":
   ENVS = ["airline", "retail"]
   STRATEGIES = ["act", "react", "fc"]
   MODEL_SIZES = ["4B", "8B", "14B", "32B"]
-  ALL_FILES = False
+  ALL_FILES = True
   CLEAN = False
-  EVALUATE = True
+  EVALUATE = False
   
   if ALL_FILES:
     for env in ENVS:
       for strategy in STRATEGIES:
-        for model_size in MODEL_SIZES[-1:]: # Currently only running 4B (Ben)
+        for model_size in MODEL_SIZES[:1]: # Currently only running 4B (Ben)
           folder_path = os.path.join("results", env, strategy, model_size)
           if not os.path.isdir(folder_path):
             continue
@@ -57,7 +57,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # progress_by_model() prints completion % for ALL strategies (act, react, fc)
     # across BOTH envs (retail, airline) for this model_size.
-    for model_size in MODEL_SIZES[1:]: # Currently only running 4B 
+    for model_size in MODEL_SIZES[:1]: # Currently only running 4B 
       progress_viewer = ProgressViewer(model_size, ENVS[0], STRATEGIES[0], None)
       progress_viewer.progress_by_model()
       
