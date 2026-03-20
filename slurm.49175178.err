@@ -1,0 +1,22 @@
+
+=====================================================================
+This module is only for creating or activating Python environments:
+$ mamba create -n myenv -c conda-forge python=3 <package_name>
+$ source activate myenv
+
+Only run "pip install" after activating an environment.
+Running pip without activating an environment is known to cause issues.
+
+To list available environments:
+$ mamba info --envs
+
+Other uses are not tested. More info: https://links.asu.edu/solpy
+=====================================================================
+
+  
+ERROR: file:///scratch/abhutka2/work/agent-project/agent-project does not appear to be a Python project: neither 'setup.py' nor 'pyproject.toml' found.
+
+EnvironmentNameNotFound: Could not find conda environment: tau-scratch-v1
+You can list all discoverable environments with `conda info --envs`.
+
+

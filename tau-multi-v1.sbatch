@@ -11,11 +11,11 @@
 #SBATCH -o slurm.%j.out # file to save job's STDOUT (%j = JobId)
 #SBATCH -e slurm.%j.err # file to save job's STDERR (%j = JobId)
 #SBATCH --mail-type=ALL # Send an e-mail when a job starts, stops, or fails
-#SBATCH --mail-user="sdutta60@asu.edu"
+#SBATCH --mail-user="abhutka2@asu.edu"
 #SBATCH --export=NONE   # Purge the job-submitting shell environment
 
 echo "Starting the script..."
-cd /scratch/sdutta60/agent-project/tau-bench
+cd /scratch/abhutka2/work/agent-project/agent-project
 
 
 echo "Loading required software..."
@@ -56,14 +56,14 @@ AGENT_VLLM_PORT=8690             # Port for agent vLLM server
 USER_MODEL="Qwen/Qwen3-32B"
 USER_VLLM_PORT=8691             # Port for user vLLM server
 
-DOMAIN="airline"                # or "airline"
+DOMAIN="retail"                # or "airline"
 AGENT_STRATEGY="multi-agent-v1"  # or "act", "react"
 NUM_TRIALS=1
 
 # ===== LOG FILE NAMING =====
 AGENT_MODEL_SAFE="${AGENT_MODEL//\//_}"  # Replace / with _ for filename
 USER_MODEL_SAFE="${USER_MODEL//\//_}"    # Replace / with _ for filename
-LOGDIR="/scratch/sdutta60/vllm-test/logs"
+LOGDIR="/scratch/abhutka2/work/agent-project/agent-project/logs"
 mkdir -p "$LOGDIR"
 TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
 AGENT_VLLM_LOG="${LOGDIR}/vllm_agent_${DOMAIN}_${AGENT_STRATEGY}_${AGENT_MODEL_SAFE}_trials${NUM_TRIALS}_${TIMESTAMP}.log"
@@ -85,7 +85,6 @@ echo "Starting Agent Model vLLM server..."
 vllm serve "$AGENT_MODEL" \
     --port "$AGENT_VLLM_PORT" \
     --tensor-parallel-size 1 \
-    --download_dir /scratch/sdutta60/huggingface_models/vllm \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_xml \
     --enforce-eager \
@@ -103,7 +102,6 @@ echo "Starting User Model vLLM server..."
 vllm serve "$USER_MODEL" \
     --port "$USER_VLLM_PORT" \
     --tensor-parallel-size 1 \
-    --download_dir /scratch/sdutta60/huggingface_models/vllm \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_xml \
     --enforce-eager \
@@ -217,7 +215,7 @@ export USER_MODEL_API_BASE=http://localhost:${USER_VLLM_PORT}/v1
 export OPENAI_API_KEY=sk-dummy
 
 # Change to tau-bench directory
-cd /scratch/sdutta60/agent-project/tau-bench
+cd /scratch/abhutka2/work/agent-project/agent-project/tau-bench
 
 # Verify both vLLM servers are still running and healthy
 echo "Verifying both vLLM servers health before starting tau-bench..."
@@ -286,4 +284,3 @@ echo "Waiting for vLLM servers to finish..."
 echo "Agent vLLM PID: $AGENT_VLLM_PID"
 echo "User vLLM PID: $USER_VLLM_PID"
 # wait $AGENT_VLLM_PID $USER_VLLM_PID
-

@@ -1,0 +1,4 @@
+
+  ERROR -- $HOME was set to: "/home/abhutka2", 
+  ERROR -- ... and not found, quitting.
+[2026-03-17T19:21:04.066] error: --task-epilog failed status=1

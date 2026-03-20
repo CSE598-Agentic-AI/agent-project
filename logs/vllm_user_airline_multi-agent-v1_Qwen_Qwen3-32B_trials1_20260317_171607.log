@@ -1,0 +1,8 @@
+Calling add_step_closure function does not have any effect. It's lazy mode only functionality. (warning logged once)
+Calling mark_step function does not have any effect. It's lazy mode only functionality. (warning logged once)
+Calling iter_mark_step function does not have any effect. It's lazy mode only functionality. (warning logged once)
+INFO 03-17 17:16:28 [__init__.py:43] Available plugins for group vllm.platform_plugins:
+INFO 03-17 17:16:28 [__init__.py:45] - hpu -> vllm_gaudi:register
+INFO 03-17 17:16:28 [__init__.py:48] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 03-17 17:16:28 [__init__.py:217] Platform plugin hpu is activated
+Received Interrupt
