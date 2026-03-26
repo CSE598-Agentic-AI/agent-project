@@ -30,6 +30,7 @@ HIGH_STAKES_ACTION_NAMES = frozenset(
         "update_reservation_passengers",
         "update_reservation_baggages",
         "send_certificate",
+        "transfer_to_human_agents",
         # Retail
         "cancel_pending_order",
         "exchange_delivered_order_items",
@@ -40,6 +41,12 @@ HIGH_STAKES_ACTION_NAMES = frozenset(
         "modify_user_address",
     }
 )
+
+FLIGHT_SEARCH_TOOL_NAMES = frozenset(
+    {"search_direct_flight", "search_onestop_flight"}
+)
+# How far back to look for a flight search before a user-facing respond (think() may sit in between).
+CRITIC_FLIGHT_SEARCH_LOOKBACK = 6
 
 
 # ---------------------------------------------------------------------------
@@ -222,68 +229,81 @@ confirmation for BOTH. Proceed to execute — do NOT ask again \"Would you like 
 with X and Y?\". The user has already confirmed and stated the full scope.
 """
 
-CRITIC_INSTRUCTION = """You are an evaluation agent for a customer service system.
+CRITIC_AGENT_SYSTEM = """You are the **Critic Agent** — an independent reviewer in a \
+multi-agent customer-service system. The Executor proposes an action; your job is to \
+catch mistakes **before** it reaches the user or the environment.
 
-# Domain Policy
+You do NOT chat with the user. You only output a structured verdict.
+
+## Your mindset
+- Treat **Actual Tool Output Data** as ground truth. If the Executor's proposed \
+`respond` text contradicts that data, **reject**.
+- Be adversarial to lazy claims: e.g. "no flights", "none meet the criteria", \
+"couldn't find any options" **must** be checked against the raw search results.
+- For **one-stop itineraries**, the user's "departure after/before X" usually applies to \
+the **first segment's** `scheduled_departure_time_est` (outbound from the origin airport). \
+Parse times as HH:MM:SS in the tool JSON; 19:00:00 is after 11:00:00.
+- If **any** itinerary in the tool output satisfies the user's stated hard constraints, \
+a `respond` that denies that is **wrong** — reject and tell the Executor to list those \
+options (and apply tie-breakers like lowest price if the user asked).
+
+## transfer_to_human_agents
+Reject if the only obstacle is that the Executor misread tool output, searched the \
+wrong dates, or failed to match an existing reservation that is already in \
+**Actual Tool Output Data**. Transfer only when the request is truly out of scope or \
+impossible after **correctly** using the data.
+
+## cancel / book / modify
+- Reject if IDs or payment methods were never seen in conversation or tool results.
+- Reject flight bookings that violate user-stated time windows when compared to the \
+proposed flight list in arguments.
+
+## Domain policy
 {wiki}
-
-# Original User Request
-{original_request}
-
-# Current Plan
-{plan_summary}
-
-# Active Step
-{active_step}
-
-# Tool Calls Already Completed (these are FACTS, do not ask to redo them)
-{completed_tools}
-
-# Actual Tool Output Data (raw results from completed tool calls)
-{tool_output_data}
-
-# Proposed Action
-Tool: {action_name}
-Arguments: {action_args}
-
-# Recent Conversation Context
-{recent_context}
-
-# Instructions
-Evaluate whether the proposed action is appropriate. Consider:
-1. Does the action align with the current plan step?
-2. Does the action follow the domain policy?
-3. Is the action safe and correct (right arguments, right tool)?
-4. If this is a response to the user, is it accurate and complete?
-5. Does the action still serve the user's ORIGINAL request? If the plan has narrowed \
-scope (e.g. handling fewer items than originally requested), reject and flag it.
-6. For flight booking or flight changes: if the ORIGINAL USER REQUEST states time windows \
-(e.g. not before 11am, after 3pm, same-day return), reject if the proposed flights \
-violate those windows. Prefer rejecting over allowing a policy-violating itinerary.
-7. IMPORTANT: If a tool call uses arguments (names, emails, IDs, etc.) that the user \
-never provided in the conversation, reject it as hallucinated data.
-
-CRITICAL RULES:
-- If a tool call has ALREADY been completed (see "Tool Calls Already Completed"), \
-do NOT reject an action just because you think that step hasn't happened yet. \
-Trust the completed tool call records as ground truth.
-- Do NOT make factual claims about product availability, pricing, or data unless \
-you can verify it from the "Actual Tool Output Data" above. If you don't have data \
-to confirm or deny something, APPROVE the action and let the tool call resolve it.
-- When in doubt about factual data, APPROVE. Only reject when you have concrete \
-evidence from the tool outputs or conversation that the action is wrong.
-- Exception: user-stated HARD CONSTRAINTS (time windows, cabin class, non-negotiable \
-preferences stated as requirements) must be enforced even if tool output listed \
-non-compliant options — reject bookings/changes that violate those constraints.
 
 You MUST respond with ONLY valid JSON (no markdown, no extra text):
 {{
   "approved": true,
-  "reason": "Why you approved or rejected",
+  "reason": "Short justification",
   "feedback_for_executor": null,
-  "risk_level": "low"
+  "risk_level": "low",
+  "evidence": null
 }}
+
+Use "evidence" for a brief quote or pointer into tool output when rejecting (else null). \
+If rejecting, "feedback_for_executor" must be concrete: what to list, what to re-read, \
+or which tool result contradicts the proposal.
 """
+
+
+def _parse_json_response(content: str) -> Optional[Dict[str, Any]]:
+    """Best-effort JSON extraction: raw → fenced block → first brace pair."""
+    if not content:
+        return None
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r"```(?:json)?\s*(.*?)\s*```", content, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    start = content.find("{")
+    if start != -1:
+        depth = 0
+        for i in range(start, len(content)):
+            if content[i] == "{":
+                depth += 1
+            elif content[i] == "}":
+                depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(content[start : i + 1])
+                except json.JSONDecodeError:
+                    break
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -315,38 +335,29 @@ class MultiAgentV1(Agent):
         self.critic_provider = critic_provider or provider
         self.max_critic_retries = max_critic_retries
         self._tools_str = json.dumps(tools_info, indent=2)
+        self._critic_agent: Optional["CriticAgent"] = None
 
-    # ---- JSON helpers ----
+    def _get_critic(self) -> "CriticAgent":
+        if self._critic_agent is None:
+            self._critic_agent = CriticAgent(
+                wiki=self.wiki,
+                model=self.critic_model,
+                provider=self.critic_provider,
+                temperature=self.temperature,
+            )
+        return self._critic_agent
 
     @staticmethod
-    def _parse_json_response(content: str) -> Optional[Dict[str, Any]]:
-        """Best-effort JSON extraction: raw → fenced block → first brace pair."""
-        if not content:
-            return None
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            pass
-        m = re.search(r"```(?:json)?\s*(.*?)\s*```", content, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(1))
-            except json.JSONDecodeError:
-                pass
-        start = content.find("{")
-        if start != -1:
-            depth = 0
-            for i in range(start, len(content)):
-                if content[i] == "{":
-                    depth += 1
-                elif content[i] == "}":
-                    depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(content[start : i + 1])
-                    except json.JSONDecodeError:
-                        break
-        return None
+    def should_run_critic_review(
+        action: Action, state: ConversationState
+    ) -> bool:
+        if action.name in HIGH_STAKES_ACTION_NAMES:
+            return True
+        if action.name == RESPOND_ACTION_NAME and state.completed_tool_calls:
+            tail = state.completed_tool_calls[-CRITIC_FLIGHT_SEARCH_LOOKBACK:]
+            if any(tc.name in FLIGHT_SEARCH_TOOL_NAMES for tc in tail):
+                return True
+        return False
 
     # ---- Formatting helpers ----
 
@@ -467,7 +478,7 @@ class MultiAgentV1(Agent):
         state.total_cost += cost
 
         content = res.choices[0].message.content or ""
-        parsed = self._parse_json_response(content)
+        parsed = _parse_json_response(content)
         state.internal_trace.append(
             {"role": "planner", "raw_output": content, "parsed": parsed, "cost": cost}
         )
@@ -529,67 +540,6 @@ class MultiAgentV1(Agent):
             }
         )
         return msg, action, cost
-
-    def _call_critic(
-        self, state: ConversationState, action: Action
-    ) -> Dict[str, Any]:
-        recent = state.executor_messages[-16:]
-        prompt = CRITIC_INSTRUCTION.format(
-            wiki=self.wiki,
-            original_request=state.original_user_request[:500],
-            plan_summary=self._format_plan(state.approved_plan),
-            active_step=self._get_active_step_description(
-                state.approved_plan, state.active_step_id
-            ),
-            completed_tools=self._format_completed_tools(
-                state.completed_tool_calls
-            ),
-            tool_output_data=self._format_tool_output_data(
-                state.completed_tool_calls
-            ),
-            action_name=action.name,
-            action_args=json.dumps(action.kwargs, indent=2),
-            recent_context=self._format_conversation_for_planner(recent),
-        )
-        messages = [
-            {"role": "system", "content": prompt},
-            {
-                "role": "user",
-                "content": "Evaluate the proposed action and return your assessment as JSON.",
-            },
-        ]
-        api_base = os.getenv("AGENT_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
-        api_key = os.getenv("AGENT_MODEL_API_KEY") or os.getenv("OPENAI_API_KEY")
-        res = completion(
-            model=self.critic_model,
-            custom_llm_provider=self.critic_provider,
-            messages=messages,
-            temperature=self.temperature,
-            api_base=api_base,
-            api_key=api_key,
-        )
-        cost = res._hidden_params.get("response_cost", 0) or 0
-        state.total_cost += cost
-
-        content = res.choices[0].message.content or ""
-        parsed = self._parse_json_response(content)
-        state.internal_trace.append(
-            {
-                "role": "critic",
-                "action_reviewed": {"name": action.name, "kwargs": action.kwargs},
-                "raw_output": content,
-                "parsed": parsed,
-                "cost": cost,
-            }
-        )
-        if parsed is None:
-            return {
-                "approved": True,
-                "reason": "Critic output unparseable, approving by default.",
-                "feedback_for_executor": None,
-                "risk_level": "medium",
-            }
-        return parsed
 
     # ---- Helpers ----
 
@@ -812,11 +762,8 @@ class MultiAgentV1(Agent):
                     )
                     continue
 
-                if (
-                    action.name in HIGH_STAKES_ACTION_NAMES
-                    and action.name != RESPOND_ACTION_NAME
-                ):
-                    crit = self._call_critic(state, action)
+                if self.should_run_critic_review(action, state):
+                    crit = self._get_critic().review(self, state, action)
                     if not crit.get("approved", True):
                         fb = crit.get("feedback_for_executor") or crit.get(
                             "reason", "Action rejected."
@@ -914,3 +861,101 @@ class MultiAgentV1(Agent):
             info={**state.info, "multi_agent_trace": state.internal_trace},
             total_cost=state.total_cost,
         )
+
+
+class CriticAgent:
+    """Independent LLM agent that reviews the Executor's proposed action before env step.
+
+    Invoked by ``MultiAgentV1`` for high-stakes tools, transfers to human, and for
+    user-facing ``respond`` immediately after flight search tool results (where false
+    negatives like "no flights" are common).
+    """
+
+    def __init__(
+        self,
+        wiki: str,
+        model: str,
+        provider: str,
+        temperature: float = 0.0,
+    ) -> None:
+        self.wiki = wiki
+        self.model = model
+        self.provider = provider
+        self.temperature = temperature
+
+    def review(
+        self,
+        orchestrator: "MultiAgentV1",
+        state: ConversationState,
+        action: Action,
+    ) -> Dict[str, Any]:
+        recent = state.executor_messages[-20:]
+        tool_blob = orchestrator._format_tool_output_data(
+            state.completed_tool_calls,
+            max_per_tool=4500,
+            max_total=18000,
+        )
+        system_prompt = CRITIC_AGENT_SYSTEM.format(wiki=self.wiki)
+        user_payload = f"""# Original User Request (task opening user message)
+{state.original_user_request[:4000]}
+
+# Current Plan
+{orchestrator._format_plan(state.approved_plan)}
+
+# Active Step
+{orchestrator._get_active_step_description(state.approved_plan, state.active_step_id)}
+
+# Tool Calls Already Completed (summaries)
+{orchestrator._format_completed_tools(state.completed_tool_calls)}
+
+# Actual Tool Output Data (raw JSON from tools — authoritative)
+{tool_blob}
+
+# Proposed action
+Tool name: {action.name}
+Arguments (JSON):
+{json.dumps(action.kwargs, indent=2)}
+
+# Recent conversation (abbreviated)
+{orchestrator._format_conversation_for_planner(recent)}
+
+Return your verdict as a single JSON object only."""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_payload},
+        ]
+        api_base = os.getenv("AGENT_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
+        api_key = os.getenv("AGENT_MODEL_API_KEY") or os.getenv("OPENAI_API_KEY")
+        res = completion(
+            model=self.model,
+            custom_llm_provider=self.provider,
+            messages=messages,
+            temperature=self.temperature,
+            api_base=api_base,
+            api_key=api_key,
+        )
+        cost = res._hidden_params.get("response_cost", 0) or 0
+        state.total_cost += cost
+
+        content = res.choices[0].message.content or ""
+        parsed = _parse_json_response(content)
+        state.internal_trace.append(
+            {
+                "role": "critic_agent",
+                "agent": "CriticAgent",
+                "action_reviewed": {"name": action.name, "kwargs": action.kwargs},
+                "raw_output": content,
+                "parsed": parsed,
+                "cost": cost,
+            }
+        )
+        if parsed is None:
+            return {
+                "approved": True,
+                "reason": "Critic agent output unparseable; approving.",
+                "feedback_for_executor": None,
+                "risk_level": "medium",
+                "evidence": None,
+            }
+        return parsed
