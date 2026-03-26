@@ -48,6 +48,27 @@ FLIGHT_SEARCH_TOOL_NAMES = frozenset(
 # How far back to look for a flight search before a user-facing respond (think() may sit in between).
 CRITIC_FLIGHT_SEARCH_LOOKBACK = 6
 
+# Phrases that indicate the executor is claiming failure after a search — worth critic review.
+_IMPOSSIBILITY_PHRASES = (
+    "no flights",
+    "none of the",
+    "couldn't find",
+    "could not find",
+    "no available",
+    "no options",
+    "no suitable",
+    "no direct flight",
+    "no one-stop",
+    "unable to find",
+    "unfortunately",
+    "doesn't meet",
+    "do not meet",
+    "does not meet",
+    "don't meet",
+    "not possible",
+    "cannot be handled",
+)
+
 
 # ---------------------------------------------------------------------------
 # State models (per-run, never stored on self to stay thread-safe)
@@ -353,10 +374,13 @@ class MultiAgentV1(Agent):
     ) -> bool:
         if action.name in HIGH_STAKES_ACTION_NAMES:
             return True
+        # Only run critic on respond if it makes an impossibility claim after a flight search.
         if action.name == RESPOND_ACTION_NAME and state.completed_tool_calls:
             tail = state.completed_tool_calls[-CRITIC_FLIGHT_SEARCH_LOOKBACK:]
             if any(tc.name in FLIGHT_SEARCH_TOOL_NAMES for tc in tail):
-                return True
+                text = (action.kwargs.get(RESPOND_ACTION_FIELD_NAME) or "").lower()
+                if any(phrase in text for phrase in _IMPOSSIBILITY_PHRASES):
+                    return True
         return False
 
     # ---- Formatting helpers ----
@@ -737,7 +761,10 @@ class MultiAgentV1(Agent):
             # ---------- EXECUTOR + VALIDATION PHASE ----------
             action: Optional[Action] = None
             executor_msg: Optional[Dict[str, Any]] = None
+            # retry_context accumulates ALL prior feedback so the critic/executor see their
+            # own history and cannot contradict themselves or loop on the same objection.
             retry_context: List[Dict[str, Any]] = []
+            critic_rejection_history: List[str] = []
 
             for attempt in range(self.max_critic_retries + 1):
                 executor_msg, action, cost = self._call_executor(
@@ -755,43 +782,65 @@ class MultiAgentV1(Agent):
                         {
                             "role": "user",
                             "content": (
-                                f"[Validator] Your proposed action was rejected: "
-                                f"{feedback}. Please try a different approach."
+                                f"[Validator attempt {attempt + 1}] Rejected: "
+                                f"{feedback}. Try a different approach."
                             ),
                         }
                     )
                     continue
 
                 if self.should_run_critic_review(action, state):
-                    crit = self._get_critic().review(self, state, action)
+                    crit = self._get_critic().review(
+                        self, state, action, critic_rejection_history
+                    )
                     if not crit.get("approved", True):
                         fb = crit.get("feedback_for_executor") or crit.get(
                             "reason", "Action rejected."
+                        )
+                        critic_rejection_history.append(
+                            f"[Attempt {attempt + 1}] Proposed {action.name} — "
+                            f"Rejected: {fb}"
                         )
                         retry_context.append(
                             {
                                 "role": "user",
                                 "content": (
-                                    f"[Critic] {fb} Propose a corrected tool call or ask "
-                                    "the user only if something is truly missing."
+                                    f"[Critic attempt {attempt + 1}] {fb}\n"
+                                    "Prior critic rejections on this turn:\n"
+                                    + "\n".join(
+                                        f"  • {r}" for r in critic_rejection_history[:-1]
+                                    )
+                                    + "\nDo NOT propose the same action again. "
+                                    "Fix the specific issue above, or ask the user "
+                                    "for the single piece of information you are missing."
                                 ),
                             }
                         )
                         continue
                 break
             else:
+                # All retries exhausted without approval. Build a targeted question from
+                # the critic's most recent concrete rejection rather than a blank ask.
+                if critic_rejection_history:
+                    last_fb = critic_rejection_history[-1]
+                    fallback_msg = (
+                        f"I'm having trouble completing your request and need a bit of "
+                        f"clarification. Here's where I got stuck: {last_fb.split('Rejected:')[-1].strip()[:300]} "
+                        "Could you confirm or correct that information so I can proceed?"
+                    )
+                else:
+                    fallback_msg = (
+                        "I want to make sure I handle your request correctly. "
+                        "Could you confirm the key details — such as the reservation, "
+                        "flights, or payment — so I can proceed?"
+                    )
                 action = Action(
                     name=RESPOND_ACTION_NAME,
-                    kwargs={
-                        RESPOND_ACTION_FIELD_NAME: (
-                            "I want to make sure I handle your request correctly. "
-                            "Could you please clarify or confirm what you'd like me to do?"
-                        )
-                    },
+                    kwargs={RESPOND_ACTION_FIELD_NAME: fallback_msg},
                 )
                 executor_msg = {
                     "role": "assistant",
-                    "content": action.kwargs[RESPOND_ACTION_FIELD_NAME],
+                    "content": fallback_msg,
                 }
 
             # ---------- EXECUTE ACTION ----------
@@ -888,12 +937,18 @@ class CriticAgent:
         orchestrator: "MultiAgentV1",
         state: ConversationState,
         action: Action,
+        prior_rejections: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         recent = state.executor_messages[-20:]
         tool_blob = orchestrator._format_tool_output_data(
             state.completed_tool_calls,
             max_per_tool=4500,
             max_total=18000,
+        )
+        prior_str = (
+            "\n".join(f"  {i+1}. {r}" for i, r in enumerate(prior_rejections))
+            if prior_rejections
+            else "None — this is the first review on this turn."
         )
         system_prompt = CRITIC_AGENT_SYSTEM.format(wiki=self.wiki)
         user_payload = f"""# Original User Request (task opening user message)
@@ -911,6 +966,9 @@ class CriticAgent:
 # Actual Tool Output Data (raw JSON from tools — authoritative)
 {tool_blob}
 
+# YOUR OWN PRIOR REJECTIONS ON THIS TURN (do not contradict these)
+{prior_str}
+
 # Proposed action
 Tool name: {action.name}
 Arguments (JSON):
@@ -918,6 +976,11 @@ Arguments (JSON):
 
 # Recent conversation (abbreviated)
 {orchestrator._format_conversation_for_planner(recent)}
+
+IMPORTANT: If you already rejected a similar action on this turn (see prior rejections above),
+only reject again if the executor made a DIFFERENT concrete mistake. Do NOT generate a new
+objection to the same action — that creates an infinite loop. If the executor fixed the
+prior issue and you have no new concrete evidence of a problem, APPROVE.
 
 Return your verdict as a single JSON object only."""
 
