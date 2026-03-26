@@ -20,6 +20,15 @@ from tau_bench.types import (
 MAX_CRITIC_RETRIES = 2
 READ_ONLY_PREFIXES = ("get_", "list_", "calculate", "think")
 
+# Short user messages that constitute confirmation of a previously-proposed action.
+CONFIRMATION_TOKENS = frozenset({
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "alright",
+    "go ahead", "proceed", "please do", "please proceed", "confirm",
+    "confirmed", "do it", "sounds good", "correct", "that's correct",
+    "that's right", "please", "go for it", "make it happen", "that works",
+    "i confirm", "i agree", "absolutely", "of course", "fine",
+})
+
 # Environment-changing tools: run LLM critic after deterministic validation passes.
 HIGH_STAKES_ACTION_NAMES = frozenset(
     {
@@ -129,6 +138,15 @@ class ConversationState:
     reward: float = 0.0
     completed_tool_calls: List[CompletedToolCall] = field(default_factory=list)
     original_user_request: str = ""
+    # "gather_info": executor may ask user questions or call read tools.
+    # "execute_action": executor MUST call a write tool; responds are blocked by ActionEnforcer.
+    executor_mode: str = "gather_info"
+    # True for exactly one iteration after a HIGH_STAKES write action completes (consumed
+    # during executor_mode computation to decide whether to keep "execute_action").
+    last_action_was_write: bool = False
+    # True while we are mid-sequence chaining write actions (set alongside executor_mode
+    # = "execute_action" after a write, cleared on respond). Used by ActionEnforcer.
+    in_write_chain: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +213,19 @@ and book an unrelated trip B with no priority). A single booking, change, or can
 with many constraints (times, bags, payment, cabin, certificates) is still ONE coherent \
 request — build one plan and execute it; do not ask the user to split "which request first" \
 for normal constraint-rich instructions.
+- BASIC ECONOMY FLIGHT CHANGE: Basic economy reservations do NOT support \
+update_reservation_flights. If the user wants to change flights on a basic economy ticket, \
+the plan MUST include two separate steps: (1) cancel_reservation, then (2) book_reservation \
+for the new itinerary. NEVER plan to use update_reservation_flights for a basic economy \
+reservation.
+- CHAINING MULTI-STEP ACTIONS: When the plan has multiple action steps (e.g. update \
+reservation A, then update reservation B, then book), set ALL of them in the plan. After \
+one step completes (you will see "[Orchestrator] … completed" in the conversation), \
+immediately advance active_step_id to the next pending step — do NOT ask the user for \
+confirmation between sequential steps that were already agreed upon.
+- ACTIVE STEP MUST BE ACTIONABLE: When the user has confirmed an action and all required \
+information is available (reservation IDs, flight numbers, payment methods), set the \
+active_step_id to the executable step — not a "gather info" or "confirm" step.
 """
 
 EXECUTOR_SYSTEM_TEMPLATE = """{wiki}
@@ -281,6 +312,28 @@ point of an update is to change something. Only reject if: (a) the reservation_i
 wrong, (b) a hard policy rule is violated (e.g. basic economy can't change flights), or \
 (c) the data in the action was never mentioned by the user or in any tool result.
 
+## Basic economy — what IS and IS NOT restricted
+- `update_reservation_flights`: BLOCKED for basic economy (cannot change flight routes).
+- `update_reservation_baggages`: ALLOWED — baggage counts are NOT restricted by cabin class.
+- `update_reservation_passengers`: ALLOWED — passenger changes are NOT restricted by cabin class.
+- `update_reservation_cabin`: ALLOWED — cabin upgrades are NOT restricted by basic economy.
+Do NOT reject update_reservation_baggages or update_reservation_passengers just because \
+the reservation is in basic economy. Only reject update_reservation_flights for basic economy.
+
+## Round-trip flight updates
+A round-trip reservation has TWO flight segments (outbound + return). When \
+update_reservation_flights is called for a round-trip, it is EXPECTED and CORRECT to \
+include both segments — even if the user only wants to change one leg. Including both is \
+required by the tool. Do NOT reject because "you included the outbound flight" or \
+"why is the return flight in there". Only reject if a specific flight number was never \
+mentioned by the user or found in search results.
+
+## update_reservation_flights — payment field
+This tool uses a `payment_id` field (a single string like "certificate_0" or \
+"gift_card_1"), NOT a `payment_methods` array. If the action has a valid `payment_id` \
+string, do NOT reject citing "wrong payment format". Only reject if the `payment_id` \
+value was never seen in conversation or tool results.
+
 ## transfer_to_human_agents
 Reject if the only obstacle is that the Executor misread tool output, searched the \
 wrong dates, or failed to match an existing reservation that is already in \
@@ -338,6 +391,15 @@ def _parse_json_response(content: str) -> Optional[Dict[str, Any]]:
                 except json.JSONDecodeError:
                     break
     return None
+
+
+def _is_user_confirmation(text: str) -> bool:
+    """Return True when a short user message is clearly an affirmative confirmation."""
+    stripped = text.strip().lower()
+    # Long messages almost always contain new information/instructions, not pure confirmation.
+    if len(stripped.split()) > 15:
+        return False
+    return any(tok in stripped for tok in CONFIRMATION_TOKENS)
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +601,14 @@ class MultiAgentV1(Agent):
         state: ConversationState,
         extra_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[Dict[str, Any], Action, float]:
+        mode_instruction = ""
+        if state.executor_mode == "execute_action":
+            mode_instruction = (
+                "\n\n**⚡ EXECUTE-ACTION MODE**: The user confirmed or a prior step just "
+                "completed. You MUST call a tool in this response. Do NOT write a text "
+                "response, acknowledgment, or description of what you will do. Identify "
+                "the tool required by the active plan step and call it NOW."
+            )
         system_prompt = EXECUTOR_SYSTEM_TEMPLATE.format(
             wiki=self.wiki,
             plan_summary=self._format_plan(state.approved_plan),
@@ -546,7 +616,7 @@ class MultiAgentV1(Agent):
                 state.approved_plan, state.active_step_id
             ),
             completed_tools=self._format_completed_tools(state.completed_tool_calls),
-        )
+        ) + mode_instruction
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt}
         ]
@@ -696,6 +766,25 @@ class MultiAgentV1(Agent):
             if s.id == state.active_step_id and s.status == "pending":
                 s.status = "in_progress"
                 return
+
+    @staticmethod
+    def _advance_active_step(state: "ConversationState") -> bool:
+        """If the current active step is 'done', advance active_step_id to the next
+        pending/in_progress step. Returns True if advanced."""
+        if not state.approved_plan or not state.active_step_id:
+            return False
+        current = next(
+            (s for s in state.approved_plan.steps if s.id == state.active_step_id),
+            None,
+        )
+        if current is None or current.status != "done":
+            return False
+        for s in state.approved_plan.steps:
+            if s.status == "pending":
+                s.status = "in_progress"
+                state.active_step_id = s.id
+                return True
+        return False
 
     @staticmethod
     def _validate_action(action: Action, state: "ConversationState") -> Dict[str, Any]:
@@ -866,6 +955,30 @@ class MultiAgentV1(Agent):
                 )
 
                 self._ensure_active_step_in_progress(state)
+                # Safety net: if planner forgot to advance past a done step, do it here.
+                self._advance_active_step(state)
+
+            # ---------- EXECUTOR MODE COMPUTATION ----------
+            # Determines whether executor is allowed to respond to user (gather_info)
+            # or must call a tool (execute_action).
+            if last_source == "user":
+                user_msg = (
+                    state.executor_messages[-1].get("content", "")
+                    if state.executor_messages
+                    else ""
+                )
+                state.executor_mode = (
+                    "execute_action" if _is_user_confirmation(user_msg) else "gather_info"
+                )
+            elif last_source == "tool":
+                # After a write action with pending steps the orchestrator already set
+                # executor_mode = "execute_action" and last_action_was_write = True.
+                # After a read-only tool we always reset to gather_info.
+                if not state.last_action_was_write:
+                    state.executor_mode = "gather_info"
+                    state.in_write_chain = False
+                # last_action_was_write flag is consumed; reset for next iteration.
+                state.last_action_was_write = False
 
             # ---------- EXECUTOR + VALIDATION PHASE ----------
             action: Optional[Action] = None
@@ -897,6 +1010,37 @@ class MultiAgentV1(Agent):
                         }
                     )
                     continue
+
+                # ActionEnforcer: block premature responds during write-chaining.
+                # Only fires when we are mid-sequence (in_write_chain=True), meaning
+                # a write action completed and there are more pending steps to execute.
+                if (
+                    action.name == RESPOND_ACTION_NAME
+                    and state.in_write_chain
+                    and state.approved_plan
+                    and state.active_step_id
+                ):
+                    active = next(
+                        (
+                            s for s in state.approved_plan.steps
+                            if s.id == state.active_step_id
+                        ),
+                        None,
+                    )
+                    if active and active.status == "in_progress":
+                        retry_context.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "[ActionEnforcer] You responded to the user, but "
+                                    "the current plan step is still in progress: "
+                                    f"'{active.description}'. You MUST call the "
+                                    "required tool to execute this step — do NOT "
+                                    "respond to the user until it is done."
+                                ),
+                            }
+                        )
+                        continue
 
                 # Deterministic payment correction (no LLM needed)
                 payment_correction = self._validate_payment_split(action, state)
@@ -997,6 +1141,47 @@ class MultiAgentV1(Agent):
                             "content": f"API output: {env_resp.observation}",
                         }
                     )
+
+                # Write-action chaining: after a HIGH_STAKES mutation, mark the current
+                # step done and inject a continuation directive so the executor proceeds
+                # to the next pending step without responding to the user first.
+                if action.name in HIGH_STAKES_ACTION_NAMES and state.approved_plan:
+                    # Mark current step done.
+                    if state.active_step_id:
+                        for s in state.approved_plan.steps:
+                            if s.id == state.active_step_id:
+                                s.status = "done"
+                                break
+                    # Find next truly pending step.
+                    pending_steps = [
+                        s for s in state.approved_plan.steps if s.status == "pending"
+                    ]
+                    if pending_steps:
+                        next_s = pending_steps[0]
+                        next_s.status = "in_progress"
+                        state.active_step_id = next_s.id
+                        state.executor_mode = "execute_action"
+                        state.last_action_was_write = True
+                        state.in_write_chain = True
+                        state.executor_messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"[Orchestrator] ✓ {action.name} completed. "
+                                    f"Proceed immediately to next step — "
+                                    f"{next_s.id}: {next_s.description}. "
+                                    "Call the required tool now. "
+                                    "Do NOT respond to the user yet."
+                                ),
+                            }
+                        )
+                    else:
+                        state.last_action_was_write = False
+                        state.in_write_chain = False
+                else:
+                    state.last_action_was_write = False
+                    state.in_write_chain = False
+
                 last_source = "tool"
             else:
                 content = action.kwargs.get(RESPOND_ACTION_FIELD_NAME, "")
@@ -1006,6 +1191,8 @@ class MultiAgentV1(Agent):
                         {"role": "user", "content": env_resp.observation},
                     ]
                 )
+                state.last_action_was_write = False
+                state.in_write_chain = False
                 last_source = "user"
 
                 # Mark active step done after responding to user
