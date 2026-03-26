@@ -20,6 +20,27 @@ from tau_bench.types import (
 MAX_CRITIC_RETRIES = 2
 READ_ONLY_PREFIXES = ("get_", "list_", "calculate", "think")
 
+# Environment-changing tools: run LLM critic after deterministic validation passes.
+HIGH_STAKES_ACTION_NAMES = frozenset(
+    {
+        # Airline
+        "book_reservation",
+        "cancel_reservation",
+        "update_reservation_flights",
+        "update_reservation_passengers",
+        "update_reservation_baggages",
+        "send_certificate",
+        # Retail
+        "cancel_pending_order",
+        "exchange_delivered_order_items",
+        "modify_pending_order_address",
+        "modify_pending_order_items",
+        "modify_pending_order_payment",
+        "return_delivered_order_items",
+        "modify_user_address",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # State models (per-run, never stored on self to stay thread-safe)
@@ -140,12 +161,12 @@ with the original plan unchanged.
 - The "plan" field must ALWAYS be present.
 - When the user mentions a fallback preference (e.g. "if X isn't available, I'll take Y"), \
 include that fallback in the plan steps so it is not lost.
-- MULTIPLE REQUEST TYPES: If the user asks for more than one different type of action in the \
-same request (e.g. return AND exchange, cancel AND modify, return AND cancel), use \
-"request_clarification" and ask the user to give one request at a time. For example: \
-"I can help with both the exchange and the return. To keep things clear, could you tell me \
-which you'd like to do first? We'll complete that one, then handle the other." Do not create \
-a plan that mixes multiple action types in one go — get the user to choose one first.
+- MULTIPLE DISTINCT OPERATIONS: Use "request_clarification" only when the user clearly \
+asks for two or more unrelated transaction types in one message (e.g. cancel reservation A \
+and book an unrelated trip B with no priority). A single booking, change, or cancellation \
+with many constraints (times, bags, payment, cabin, certificates) is still ONE coherent \
+request — build one plan and execute it; do not ask the user to split "which request first" \
+for normal constraint-rich instructions.
 """
 
 EXECUTOR_SYSTEM_TEMPLATE = """{wiki}
@@ -186,6 +207,12 @@ explanations, tell the user you cannot help with this request without authentica
 "I want X, but if X is unavailable I'll take Y", and you discover X is unavailable, \
 apply the fallback Y directly. Do NOT present other alternatives that differ from what \
 the user explicitly stated as their fallback.
+- CONSTRAINT CHECK BEFORE OFFERS OR BOOKING: When the user states hard limits (e.g. \
+"not before 11am", "after 3pm", "same day only", "economy only"), filter flight or itinerary \
+options so you NEVER present or book an option that violates those limits. Among options \
+that satisfy ALL hard constraints, apply the user's tie-breakers (e.g. lowest price, \
+shortest total time). If no option satisfies the constraints, say so and search again or \
+ask a minimal clarifying question.
 - Be decisive and efficient. When you have all information needed, proceed to the action \
 rather than asking for one more round of confirmation. ONE confirmation round is sufficient.
 - COMBINED CONFIRMATION: When the user in one message both (a) confirms a proposed action \
@@ -230,7 +257,10 @@ Evaluate whether the proposed action is appropriate. Consider:
 4. If this is a response to the user, is it accurate and complete?
 5. Does the action still serve the user's ORIGINAL request? If the plan has narrowed \
 scope (e.g. handling fewer items than originally requested), reject and flag it.
-6. IMPORTANT: If a tool call uses arguments (names, emails, IDs, etc.) that the user \
+6. For flight booking or flight changes: if the ORIGINAL USER REQUEST states time windows \
+(e.g. not before 11am, after 3pm, same-day return), reject if the proposed flights \
+violate those windows. Prefer rejecting over allowing a policy-violating itinerary.
+7. IMPORTANT: If a tool call uses arguments (names, emails, IDs, etc.) that the user \
 never provided in the conversation, reject it as hallucinated data.
 
 CRITICAL RULES:
@@ -242,6 +272,9 @@ you can verify it from the "Actual Tool Output Data" above. If you don't have da
 to confirm or deny something, APPROVE the action and let the tool call resolve it.
 - When in doubt about factual data, APPROVE. Only reject when you have concrete \
 evidence from the tool outputs or conversation that the action is wrong.
+- Exception: user-stated HARD CONSTRAINTS (time windows, cabin class, non-negotiable \
+preferences stated as requirements) must be enforced even if tool output listed \
+non-compliant options — reject bookings/changes that violate those constraints.
 
 You MUST respond with ONLY valid JSON (no markdown, no extra text):
 {{
@@ -572,6 +605,16 @@ class MultiAgentV1(Agent):
         return any(n in low for n in negations) or low in ("no", "nope", "nah")
 
     @staticmethod
+    def _ensure_active_step_in_progress(state: "ConversationState") -> None:
+        """Planner often leaves the active step as pending; executor needs in_progress."""
+        if not state.approved_plan or not state.active_step_id:
+            return
+        for s in state.approved_plan.steps:
+            if s.id == state.active_step_id and s.status == "pending":
+                s.status = "in_progress"
+                return
+
+    @staticmethod
     def _validate_action(action: Action, state: "ConversationState") -> Dict[str, Any]:
         """Deterministic validation replacing the LLM critic.
         Checks that referenced IDs actually exist in conversation or tool results."""
@@ -623,7 +666,7 @@ class MultiAgentV1(Agent):
         self,
         env: Env,
         task_index: Optional[int] = None,
-        max_num_steps: int = 30,
+        max_num_steps: int = 40,
     ) -> SolveResult:
         reset_resp = env.reset(task_index=task_index)
         state = ConversationState()
@@ -654,13 +697,21 @@ class MultiAgentV1(Agent):
                     state.approved_plan = Plan.from_dict(proposed)
                 state.pending_plan_update = None
 
-            # ---------- PLANNER PHASE (runs on every user message) ----------
-            if last_source == "user":
+            # ---------- PLANNER PHASE ----------
+            # Run after user messages and after tool observations so the plan/active step
+            # stay aligned during multi-tool stretches (no silent drift).
+            if last_source in ("user", "tool"):
                 planner_result = self._call_planner(state)
                 decision = planner_result.get("decision", "continue_existing_plan")
                 plan_data = planner_result.get("plan")
 
-                if decision == "propose_plan_change":
+                if last_source == "tool" and decision in (
+                    "request_clarification",
+                    "propose_plan_change",
+                ):
+                    decision = "continue_existing_plan"
+
+                if decision == "propose_plan_change" and last_source == "user":
                     plan_change_proposals += 1
                     if plan_change_proposals > 2:
                         if plan_data and isinstance(plan_data, dict):
@@ -699,7 +750,7 @@ class MultiAgentV1(Agent):
                 else:
                     plan_change_proposals = 0
 
-                if decision == "request_clarification":
+                if decision == "request_clarification" and last_source == "user":
                     question = planner_result.get(
                         "confirmation_question",
                         "Could you provide more details about your request?",
@@ -731,6 +782,8 @@ class MultiAgentV1(Agent):
                     "active_step_id", state.active_step_id
                 )
 
+                self._ensure_active_step_in_progress(state)
+
             # ---------- EXECUTOR + VALIDATION PHASE ----------
             action: Optional[Action] = None
             executor_msg: Optional[Dict[str, Any]] = None
@@ -743,21 +796,42 @@ class MultiAgentV1(Agent):
                 state.total_cost += cost
 
                 validation = self._validate_action(action, state)
-                if validation.get("approved", True):
-                    break
-                feedback = validation.get(
-                    "feedback_for_executor",
-                    "Please reconsider your action.",
-                )
-                retry_context.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"[Validator] Your proposed action was rejected: "
-                            f"{feedback}. Please try a different approach."
-                        ),
-                    }
-                )
+                if not validation.get("approved", True):
+                    feedback = validation.get(
+                        "feedback_for_executor",
+                        "Please reconsider your action.",
+                    )
+                    retry_context.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"[Validator] Your proposed action was rejected: "
+                                f"{feedback}. Please try a different approach."
+                            ),
+                        }
+                    )
+                    continue
+
+                if (
+                    action.name in HIGH_STAKES_ACTION_NAMES
+                    and action.name != RESPOND_ACTION_NAME
+                ):
+                    crit = self._call_critic(state, action)
+                    if not crit.get("approved", True):
+                        fb = crit.get("feedback_for_executor") or crit.get(
+                            "reason", "Action rejected."
+                        )
+                        retry_context.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"[Critic] {fb} Propose a corrected tool call or ask "
+                                    "the user only if something is truly missing."
+                                ),
+                            }
+                        )
+                        continue
+                break
             else:
                 action = Action(
                     name=RESPOND_ACTION_NAME,
@@ -824,7 +898,10 @@ class MultiAgentV1(Agent):
                 # Mark active step done after responding to user
                 if state.approved_plan and state.active_step_id:
                     for s in state.approved_plan.steps:
-                        if s.id == state.active_step_id and s.status == "in_progress":
+                        if s.id == state.active_step_id and s.status in (
+                            "in_progress",
+                            "pending",
+                        ):
                             s.status = "done"
                             break
 
