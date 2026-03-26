@@ -241,6 +241,11 @@ options so you NEVER present or book an option that violates those limits. Among
 that satisfy ALL hard constraints, apply the user's tie-breakers (e.g. lowest price, \
 shortest total time). If no option satisfies the constraints, say so and search again or \
 ask a minimal clarifying question.
+- EXECUTE IMMEDIATELY: When you have decided on an action and have all required information, \
+call the tool in THIS response. NEVER write a message that says "I will now…", "I'll proceed \
+with…", or "I'm going to…" without calling the tool in the same turn. Describing a future \
+action without executing it is a failure — the user's response to that description will be \
+"thank you" and the task will end without the action being performed.
 - Be decisive and efficient. When you have all information needed, proceed to the action \
 rather than asking for one more round of confirmation. ONE confirmation round is sufficient.
 - COMBINED CONFIRMATION: When the user in one message both (a) confirms a proposed action \
@@ -267,6 +272,14 @@ Parse times as HH:MM:SS in the tool JSON; 19:00:00 is after 11:00:00.
 - If **any** itinerary in the tool output satisfies the user's stated hard constraints, \
 a `respond` that denies that is **wrong** — reject and tell the Executor to list those \
 options (and apply tie-breakers like lowest price if the user asked).
+
+## update_* actions (update_reservation_flights, update_reservation_passengers, etc.)
+These actions specify the DESIRED NEW STATE — they will DIFFER from current tool output \
+by design. Do NOT reject because "the passenger in the reservation is X but the action \
+says Y" or "the flight in the reservation is A but the action proposes B". The entire \
+point of an update is to change something. Only reject if: (a) the reservation_id is \
+wrong, (b) a hard policy rule is violated (e.g. basic economy can't change flights), or \
+(c) the data in the action was never mentioned by the user or in any tool result.
 
 ## transfer_to_human_agents
 Reject if the only obstacle is that the Executor misread tool output, searched the \
@@ -579,6 +592,102 @@ class MultiAgentV1(Agent):
         return any(n in low for n in negations) or low in ("no", "nope", "nah")
 
     @staticmethod
+    def _extract_user_details(state: "ConversationState") -> Optional[Dict[str, Any]]:
+        """Return parsed get_user_details result from the most recent call."""
+        for tc in reversed(state.completed_tool_calls):
+            if tc.name == "get_user_details" and tc.full_result:
+                try:
+                    return json.loads(tc.full_result)
+                except Exception:
+                    pass
+        return None
+
+    @staticmethod
+    def _compute_payment_split(
+        profile: Dict[str, Any],
+        total_amount: float,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Policy-compliant split: ≤1 certificate, ≤3 gift cards, ≤1 credit card.
+        Certificates used first (largest), then gift cards (largest first), then credit card."""
+        pms = profile.get("payment_methods", {})
+        certificates, gift_cards, credit_cards = [], [], []
+        for pid, pm in pms.items():
+            src = pm.get("source", "")
+            if src == "certificate":
+                certificates.append((pm.get("amount", 0), pid))
+            elif src == "gift_card":
+                gift_cards.append((pm.get("amount", 0), pid))
+            elif src == "credit_card":
+                credit_cards.append(pid)
+
+        certificates.sort(reverse=True)
+        gift_cards.sort(reverse=True)
+
+        result: List[Dict[str, Any]] = []
+        remaining = round(float(total_amount), 2)
+
+        if certificates and remaining > 0:
+            amt, pid = certificates[0]
+            use = round(min(amt, remaining), 2)
+            result.append({"payment_id": pid, "amount": use})
+            remaining = round(remaining - use, 2)
+
+        for amt, pid in gift_cards[:3]:
+            if remaining <= 0:
+                break
+            use = round(min(amt, remaining), 2)
+            if use > 0:
+                result.append({"payment_id": pid, "amount": use})
+                remaining = round(remaining - use, 2)
+
+        if remaining > 0.01 and credit_cards:
+            result.append({"payment_id": credit_cards[0], "amount": round(remaining, 2)})
+            remaining = 0.0
+
+        return result if remaining <= 0.01 else None
+
+    @staticmethod
+    def _validate_payment_split(
+        action: Action, state: "ConversationState"
+    ) -> Optional[str]:
+        """Returns a correction message if the proposed payment split violates policy,
+        else None (no correction needed)."""
+        if action.name != "book_reservation":
+            return None
+        proposed_pms = action.kwargs.get("payment_methods")
+        if not proposed_pms or not isinstance(proposed_pms, list):
+            return None
+
+        profile = MultiAgentV1._extract_user_details(state)
+        if not profile:
+            return None
+
+        total = round(sum(pm.get("amount", 0) for pm in proposed_pms), 2)
+        if total <= 0:
+            return None
+
+        correct = MultiAgentV1._compute_payment_split(profile, total)
+        if not correct:
+            return None
+
+        def _sig(pms):
+            return sorted((pm["payment_id"], pm["amount"]) for pm in pms)
+
+        if _sig(proposed_pms) == _sig(correct):
+            return None  # already correct
+
+        correct_lines = "\n".join(
+            f"  - {pm['payment_id']}: ${pm['amount']}" for pm in correct
+        )
+        return (
+            f"[PaymentSplitter] The proposed payment split for ${total} is wrong. "
+            f"Policy: ≤1 certificate (largest first), ≤3 gift cards (largest first), "
+            f"≤1 credit card for remainder.\n"
+            f"Correct split:\n{correct_lines}\n"
+            "Use EXACTLY these payment_methods in your next booking call."
+        )
+
+    @staticmethod
     def _ensure_active_step_in_progress(state: "ConversationState") -> None:
         """Planner often leaves the active step as pending; executor needs in_progress."""
         if not state.approved_plan or not state.active_step_id:
@@ -786,6 +895,14 @@ class MultiAgentV1(Agent):
                                 f"{feedback}. Try a different approach."
                             ),
                         }
+                    )
+                    continue
+
+                # Deterministic payment correction (no LLM needed)
+                payment_correction = self._validate_payment_split(action, state)
+                if payment_correction:
+                    retry_context.append(
+                        {"role": "user", "content": payment_correction}
                     )
                     continue
 
