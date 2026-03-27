@@ -20,6 +20,16 @@ from tau_bench.types import (
 MAX_CRITIC_RETRIES = 2
 READ_ONLY_PREFIXES = ("get_", "list_", "calculate", "think")
 
+# Top-level orchestration state machine (drives bind → run → mandatory terminal message).
+SM_BIND_CONTEXT = "bind_context"
+SM_RUN = "run"
+SM_TERMINAL_GATE = "terminal_gate"
+
+_FORBIDDEN_TERMINAL_SUBSTRINGS = (
+    "i have completed all planned actions",
+    "completed all planned actions",
+)
+
 # Short user messages that constitute confirmation of a previously-proposed action.
 CONFIRMATION_TOKENS = frozenset({
     "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "alright",
@@ -160,6 +170,11 @@ class ConversationState:
     completed_tool_calls: List[CompletedToolCall] = field(default_factory=list)
     original_user_request: str = ""
     planner_repair_hints: List[str] = field(default_factory=list)
+    # State machine: bind_context runs once; run is the planner/execute loop; terminal_gate
+    # emits a mandatory user-facing closing message when the plan has no active step.
+    orchestrator_phase: str = SM_BIND_CONTEXT
+    bound_slots: Dict[str, str] = field(default_factory=dict)
+    executor_mode: str = "normal"
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +197,9 @@ PLANNER_INSTRUCTION = """You are a planning agent for a customer-service workflo
 
 # Planner Repair Hints (from critic/tool failures)
 {repair_hints}
+
+# Pre-bound context (parsed from the opening user message — authoritative for tool args)
+{bound_context}
 
 # Conversation So Far
 {conversation}
@@ -219,6 +237,39 @@ Rules:
 - If user materially changes request, use propose_plan_change with confirmation_question.
 - If information is missing, use request_clarification with confirmation_question.
 - Never output vague non-executable steps.
+- If Pre-bound context lists user_id or reservation_id, you MUST use those exact values in tool_args (never user_id_placeholder or made-up ids).
+"""
+
+TERMINAL_COMPOSER_INSTRUCTION = """You write exactly ONE assistant message to the user.
+
+The automated plan has no further executable tool steps for this turn. Your message must close the interaction usefully.
+
+# Domain policy (follow for tone and constraints)
+{wiki}
+
+# Original user request (opening message)
+{original_request}
+
+# Tool calls completed this session (summaries)
+{completed_tools}
+
+# Most recent tool raw result (truncated)
+{last_tool_blob}
+
+# Recent visible assistant/user text (abbreviated)
+{recent_dialog}
+
+# Required JSON only (no markdown)
+{{
+  "terminal_kind": "summary_done" | "clarify_needed" | "policy_block" | "handoff",
+  "message": "plain text to show the user"
+}}
+
+Rules:
+- Do NOT say you "completed all planned actions" or any generic automation meta phrase.
+- Be specific: cite reservation ids, flight numbers, or outcomes when they appear in the context above.
+- If nothing was accomplished and the user still needs help, use clarify_needed with one minimal question.
+- If transfer_to_human_agents was invoked in the session, use handoff and confirm escalation briefly.
 """
 
 EXECUTOR_SYSTEM_TEMPLATE = """{wiki}
@@ -466,6 +517,175 @@ class MultiAgentV1(Agent):
         return self._critic_agent
 
     @staticmethod
+    def _extract_bound_slots(opening_text: str) -> Dict[str, str]:
+        """Parse common identifiers from the simulator user's opening message."""
+        if not opening_text:
+            return {}
+        slots: Dict[str, str] = {}
+        m = re.search(r"(?i)\byour\s+user\s+id\s+is\s+([a-z0-9_]+)\b", opening_text)
+        if m:
+            slots["user_id"] = m.group(1).lower()
+        else:
+            m2 = re.search(r"(?i)\buser\s+id\s+is\s+([a-z0-9_]+)\b", opening_text)
+            if m2:
+                slots["user_id"] = m2.group(1).lower()
+        rm = re.search(
+            r"(?i)\breservation(?:\s+id)?\s+([A-Z0-9]{4,10})\b",
+            opening_text,
+        )
+        if rm:
+            slots["reservation_id"] = rm.group(1).upper()
+        return slots
+
+    @staticmethod
+    def _format_bound_context_for_planner(bound_slots: Dict[str, str]) -> str:
+        if not bound_slots:
+            return (
+                "(none extracted from opening message — obtain ids from the user or "
+                "tools as usual.)"
+            )
+        lines = [
+            "Parsed from the **first user message**. Use these in `tool_args` when applicable;",
+            "never use placeholders like `user_id_placeholder`.",
+        ]
+        for k, v in bound_slots.items():
+            lines.append(f"- **{k}**: `{v}`")
+        return "\n".join(lines)
+
+    def _apply_bound_slots_to_plan(self, state: ConversationState) -> None:
+        """Fill obvious placeholder tool args from bound slots (deterministic repair)."""
+        plan = state.approved_plan
+        if plan is None:
+            return
+        uid = state.bound_slots.get("user_id")
+        rid = state.bound_slots.get("reservation_id")
+        for s in plan.steps:
+            if not isinstance(s.tool_args, dict):
+                continue
+            if uid:
+                v = s.tool_args.get("user_id")
+                if isinstance(v, str) and (
+                    v.strip().lower() in ("user_id_placeholder", "placeholder", "")
+                ):
+                    s.tool_args["user_id"] = uid
+            if rid:
+                v2 = s.tool_args.get("reservation_id")
+                if isinstance(v2, str) and (
+                    v2.strip().lower()
+                    in ("reservation_id_placeholder", "placeholder", "")
+                ):
+                    s.tool_args["reservation_id"] = rid
+
+    @staticmethod
+    def _is_forbidden_terminal_message(text: str) -> bool:
+        t = (text or "").strip().lower()
+        if not t:
+            return True
+        return any(sub in t for sub in _FORBIDDEN_TERMINAL_SUBSTRINGS)
+
+    @staticmethod
+    def _terminal_fallback_message(state: ConversationState) -> str:
+        names = [tc.name for tc in state.completed_tool_calls]
+        if "transfer_to_human_agents" in names:
+            return (
+                "I've escalated this to a human specialist who can continue helping you "
+                "with the details we discussed."
+            )
+        if not state.completed_tool_calls:
+            return (
+                "I wasn't able to run further automated steps toward your request yet. "
+                "What should I focus on next—booking, an existing reservation, or "
+                "something else?"
+            )
+        last = state.completed_tool_calls[-1]
+        snippet = (last.result_summary or last.full_result or "")[:240].strip()
+        if snippet:
+            return (
+                f"Here's where we paused after `{last.name}`: {snippet}\n\n"
+                "Tell me if you want to continue from here or adjust the request."
+            )
+        return f"The last step was `{last.name}`. Tell me how you'd like to proceed."
+
+    def _call_terminal_composer(self, state: ConversationState) -> Optional[str]:
+        last_blob = "None"
+        if state.completed_tool_calls:
+            tc = state.completed_tool_calls[-1]
+            last_blob = (tc.full_result or tc.result_summary or "")[:3500]
+        recent = state.executor_messages[-16:]
+        dialog = self._format_conversation_for_planner(recent)
+        prompt = TERMINAL_COMPOSER_INSTRUCTION.format(
+            wiki=self.wiki[:12000],
+            original_request=(state.original_user_request or "")[:4000],
+            completed_tools=self._format_completed_tools(state.completed_tool_calls),
+            last_tool_blob=last_blob,
+            recent_dialog=dialog,
+        )
+        messages = [
+            {"role": "system", "content": prompt},
+            {
+                "role": "user",
+                "content": "Produce the closing JSON for the user now.",
+            },
+        ]
+        api_base = os.getenv("AGENT_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
+        api_key = os.getenv("AGENT_MODEL_API_KEY") or os.getenv("OPENAI_API_KEY")
+        total_cost = 0.0
+        parsed: Optional[Dict[str, Any]] = None
+        raw_output = ""
+        for _ in range(2):
+            res = completion(
+                model=self.model,
+                custom_llm_provider=self.provider,
+                messages=messages,
+                temperature=self.temperature,
+                api_base=api_base,
+                api_key=api_key,
+            )
+            cost = res._hidden_params.get("response_cost", 0) or 0
+            total_cost += cost
+            content = res.choices[0].message.content or ""
+            raw_output = content
+            parsed = _parse_json_response(content)
+            if (
+                parsed
+                and isinstance(parsed.get("message"), str)
+                and parsed["message"].strip()
+            ):
+                break
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Invalid. Return JSON with non-empty message string only.",
+                }
+            )
+            parsed = None
+        state.total_cost += total_cost
+        state.internal_trace.append(
+            {
+                "role": "terminal_composer",
+                "raw_output": raw_output,
+                "parsed": parsed,
+                "cost": total_cost,
+            }
+        )
+        if not parsed or not isinstance(parsed.get("message"), str):
+            return None
+        return parsed["message"].strip()
+
+    def _compose_terminal_user_message(self, state: ConversationState) -> str:
+        candidate = self._call_terminal_composer(state)
+        if candidate and not self._is_forbidden_terminal_message(candidate):
+            return candidate
+        state.internal_trace.append(
+            {
+                "role": "orchestrator_state",
+                "phase": SM_TERMINAL_GATE,
+                "note": "terminal_composer_unusable_or_forbidden; used_fallback",
+            }
+        )
+        return self._terminal_fallback_message(state)
+
+    @staticmethod
     def should_run_critic_review(
         action: Action, state: ConversationState
     ) -> bool:
@@ -577,12 +797,14 @@ class MultiAgentV1(Agent):
             if state.planner_repair_hints
             else "None"
         )
+        bound_context = self._format_bound_context_for_planner(state.bound_slots)
         prompt = PLANNER_INSTRUCTION.format(
             wiki=self.wiki,
             tools=self._tools_str,
             current_plan=self._format_plan(state.approved_plan),
             pending_update=pending_str,
             repair_hints=repair_hints,
+            bound_context=bound_context,
             conversation=self._format_conversation_for_planner(
                 state.executor_messages
             ),
@@ -977,6 +1199,15 @@ class MultiAgentV1(Agent):
             {"role": "user", "content": reset_resp.observation},
         ]
         state.original_user_request = reset_resp.observation
+        state.bound_slots = self._extract_bound_slots(state.original_user_request or "")
+        state.internal_trace.append(
+            {
+                "role": "orchestrator_state",
+                "phase": SM_BIND_CONTEXT,
+                "bound_slots": dict(state.bound_slots),
+            }
+        )
+        state.orchestrator_phase = SM_RUN
         last_source = "user"
         need_replan = True
 
@@ -991,6 +1222,7 @@ class MultiAgentV1(Agent):
                 ):
                     state.approved_plan = Plan.from_dict(proposed)
                     state.active_step_id = state.pending_plan_update.get("active_step_id")
+                    self._apply_bound_slots_to_plan(state)
                 state.pending_plan_update = None
 
             if need_replan or last_source == "user" or not self._has_open_steps(state.approved_plan):
@@ -1055,12 +1287,21 @@ class MultiAgentV1(Agent):
 
                 if plan_data and isinstance(plan_data, dict):
                     state.approved_plan = Plan.from_dict(plan_data)
+                    self._apply_bound_slots_to_plan(state)
                 state.active_step_id = planner_result.get("active_step_id", state.active_step_id)
                 need_replan = False
 
             step = self._get_active_step(state.approved_plan, state.active_step_id)
             if step is None:
-                final_msg = "I have completed all planned actions."
+                state.orchestrator_phase = SM_TERMINAL_GATE
+                final_msg = self._compose_terminal_user_message(state)
+                state.internal_trace.append(
+                    {
+                        "role": "orchestrator_state",
+                        "phase": SM_TERMINAL_GATE,
+                        "message_preview": (final_msg or "")[:400],
+                    }
+                )
                 env_resp = env.step(
                     Action(
                         name=RESPOND_ACTION_NAME,
@@ -1079,6 +1320,7 @@ class MultiAgentV1(Agent):
                 if env_resp.done:
                     break
                 need_replan = True
+                state.orchestrator_phase = SM_RUN
                 continue
 
             step.status = "in_progress"
