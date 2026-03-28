@@ -18,12 +18,20 @@ from tau_bench.types import (
 )
 
 MAX_CRITIC_RETRIES = 2
+# After a critic reject, replan and re-review this many times before giving up
+# (does not consume outer max_num_steps; saves user/env turns).
+MAX_PLANNER_CRITIC_RECONCILE = 4
 READ_ONLY_PREFIXES = ("get_", "list_", "calculate", "think")
 
 # Top-level orchestration state machine (drives bind → run → mandatory terminal message).
 SM_BIND_CONTEXT = "bind_context"
 SM_RUN = "run"
 SM_TERMINAL_GATE = "terminal_gate"
+
+# Defer terminal composer until few outer iterations remain (avoids bogus mid-task closes).
+TERMINAL_GATE_MIN_REMAINING_OUTER_STEPS = 2
+# After this many deferrals in a row, run terminal anyway (avoid infinite replan).
+MAX_TERMINAL_DEFERRALS = 3
 
 _FORBIDDEN_TERMINAL_SUBSTRINGS = (
     "i have completed all planned actions",
@@ -237,7 +245,7 @@ Rules:
 - If user materially changes request, use propose_plan_change with confirmation_question.
 - If information is missing, use request_clarification with confirmation_question.
 - Never output vague non-executable steps.
-- If Pre-bound context lists user_id or reservation_id, you MUST use those exact values in tool_args (never user_id_placeholder or made-up ids).
+- If Pre-bound context lists user_id, reservation_id, or order_id, you MUST use those exact values in tool_args (never *_placeholder or made-up ids).
 """
 
 TERMINAL_COMPOSER_INSTRUCTION = """You write exactly ONE assistant message to the user.
@@ -535,6 +543,39 @@ class MultiAgentV1(Agent):
         )
         if rm:
             slots["reservation_id"] = rm.group(1).upper()
+        om = re.search(r"(?i)\border\s+(#[A-Z0-9]{4,}|[A-Z0-9]{5,})\b", opening_text)
+        if om:
+            raw = om.group(1)
+            slots["order_id"] = raw if raw.startswith("#") else f"#{raw.upper()}"
+        return slots
+
+    @staticmethod
+    def _build_bound_slots(
+        original_user_message: str, info: Dict[str, Any]
+    ) -> Dict[str, str]:
+        """Bind slots from env task metadata (authoritative) plus NL fallbacks.
+
+        Task.user_id and task.instruction come from reset ``info`` (ground truth).
+        The user-facing opening message may paraphrase; use it only to fill gaps.
+        """
+        slots: Dict[str, str] = {}
+        task = info.get("task") if isinstance(info, dict) else None
+        if isinstance(task, dict):
+            uid = task.get("user_id")
+            if uid:
+                slots["user_id"] = str(uid).strip().lower()
+            instruction = task.get("instruction") or ""
+            inst_slots = MultiAgentV1._extract_bound_slots(instruction)
+            if "reservation_id" in inst_slots:
+                slots["reservation_id"] = inst_slots["reservation_id"]
+            if "order_id" in inst_slots:
+                slots["order_id"] = inst_slots["order_id"]
+            if "user_id" not in slots and "user_id" in inst_slots:
+                slots["user_id"] = inst_slots["user_id"]
+        obs_slots = MultiAgentV1._extract_bound_slots(original_user_message or "")
+        for key, val in obs_slots.items():
+            if key not in slots:
+                slots[key] = val
         return slots
 
     @staticmethod
@@ -575,6 +616,15 @@ class MultiAgentV1(Agent):
                     in ("reservation_id_placeholder", "placeholder", "")
                 ):
                     s.tool_args["reservation_id"] = rid
+            oid = state.bound_slots.get("order_id")
+            if oid:
+                v3 = s.tool_args.get("order_id")
+                if isinstance(v3, str) and v3.strip().lower() in (
+                    "order_id_placeholder",
+                    "placeholder",
+                    "",
+                ):
+                    s.tool_args["order_id"] = oid
 
     @staticmethod
     def _is_forbidden_terminal_message(text: str) -> bool:
@@ -1179,6 +1229,200 @@ class MultiAgentV1(Agent):
             kwargs={RESPOND_ACTION_FIELD_NAME: message.get("content", "")},
         )
 
+    def _critic_planner_reconcile_loop(
+        self,
+        state: ConversationState,
+        env: Env,
+        step: PlanStep,
+        action: Action,
+    ) -> Tuple[str, PlanStep, Action, bool]:
+        """Run critic → on reject, call planner again → new step/action → repeat until
+        critic approves, a non-reviewed action is produced, max rounds, or user-facing
+        planner decision.
+
+        Returns:
+            (status, step, action, env_done) with status in:
+            - ``ok``: critic approved (or replan produced an action that needs no review)
+            - ``give_up``: exceeded reconcile rounds or validation failed after replan
+            - ``user_interrupted``: request_clarification / propose_plan_change sent to user
+            - ``no_active_step``: planner left no executable step (outer loop should replan / terminal)
+
+            ``env_done`` is True only when ``user_interrupted`` and env.step reported done.
+        """
+        reject_count = 0
+        cur_step = step
+        cur_action = action
+
+        while True:
+            critic_result = self._get_critic().review_with_verification(
+                orchestrator=self,
+                state=state,
+                action=cur_action,
+                env=env,
+            )
+            if critic_result.get("approved", False):
+                state.internal_trace.append(
+                    {
+                        "role": "critic_gate",
+                        "step_id": cur_step.id,
+                        "planned_action": {
+                            "name": cur_action.name,
+                            "kwargs": cur_action.kwargs,
+                        },
+                        "critic_result": critic_result,
+                        "result": "approved",
+                    }
+                )
+                return ("ok", cur_step, cur_action, False)
+
+            cur_step.status = "failed"
+            fb = critic_result.get("feedback_for_executor") or critic_result.get(
+                "reason", "Critic rejected action."
+            )
+            state.planner_repair_hints.append(fb)
+            state.internal_trace.append(
+                {
+                    "role": "critic_gate",
+                    "step_id": cur_step.id,
+                    "planned_action": {
+                        "name": cur_action.name,
+                        "kwargs": cur_action.kwargs,
+                    },
+                    "critic_result": critic_result,
+                    "result": "blocked",
+                }
+            )
+
+            reject_count += 1
+            if reject_count > MAX_PLANNER_CRITIC_RECONCILE:
+                return ("give_up", cur_step, cur_action, False)
+
+            state.internal_trace.append(
+                {
+                    "role": "planner_critic_reconcile",
+                    "attempt": reject_count,
+                    "event": "replan_after_critic_reject",
+                }
+            )
+
+            planner_result = self._call_planner(state)
+            decision = planner_result.get("decision", "continue_existing_plan")
+            plan_data = planner_result.get("plan")
+
+            if decision == "request_clarification":
+                question = planner_result.get(
+                    "confirmation_question",
+                    "Could you provide more details to continue?",
+                )
+                env_resp = env.step(
+                    Action(
+                        name=RESPOND_ACTION_NAME,
+                        kwargs={RESPOND_ACTION_FIELD_NAME: question},
+                    )
+                )
+                state.reward = env_resp.reward
+                state.info = {**state.info, **env_resp.info.model_dump()}
+                state.executor_messages.extend(
+                    [
+                        {"role": "assistant", "content": question},
+                        {"role": "user", "content": env_resp.observation},
+                    ]
+                )
+                return ("user_interrupted", cur_step, cur_action, env_resp.done)
+
+            if decision == "propose_plan_change":
+                state.pending_plan_update = {
+                    "proposed_plan": plan_data,
+                    "active_step_id": planner_result.get("active_step_id"),
+                    "reason": planner_result.get("reason", ""),
+                }
+                question = planner_result.get(
+                    "confirmation_question",
+                    "Please confirm the updated plan.",
+                )
+                env_resp = env.step(
+                    Action(
+                        name=RESPOND_ACTION_NAME,
+                        kwargs={RESPOND_ACTION_FIELD_NAME: question},
+                    )
+                )
+                state.reward = env_resp.reward
+                state.info = {**state.info, **env_resp.info.model_dump()}
+                state.executor_messages.extend(
+                    [
+                        {"role": "assistant", "content": question},
+                        {"role": "user", "content": env_resp.observation},
+                    ]
+                )
+                return ("user_interrupted", cur_step, cur_action, env_resp.done)
+
+            if plan_data and isinstance(plan_data, dict):
+                state.approved_plan = Plan.from_dict(plan_data)
+                self._apply_bound_slots_to_plan(state)
+            state.active_step_id = planner_result.get(
+                "active_step_id", state.active_step_id
+            )
+
+            new_step = self._get_active_step(
+                state.approved_plan, state.active_step_id
+            )
+            if new_step is None:
+                return ("no_active_step", cur_step, cur_action, False)
+
+            new_step.status = "in_progress"
+            state.active_step_id = new_step.id
+            cur_action = Action(name=new_step.tool_name, kwargs=new_step.tool_args)
+            cur_step = new_step
+
+            validation = self._validate_action(cur_action, state)
+            if not validation.get("approved", True):
+                cur_step.status = "failed"
+                state.planner_repair_hints.append(
+                    validation.get(
+                        "feedback_for_executor", "Validator rejected planned action."
+                    )
+                )
+                state.internal_trace.append(
+                    {
+                        "role": "executor_strict",
+                        "step_id": cur_step.id,
+                        "planned_action": {
+                            "name": cur_action.name,
+                            "kwargs": cur_action.kwargs,
+                        },
+                        "result": "validation_reject",
+                        "feedback": validation.get("feedback_for_executor"),
+                    }
+                )
+                return ("give_up", cur_step, cur_action, False)
+
+            if cur_action.name == "book_reservation":
+                payment_correction = self._validate_payment_split(cur_action, state)
+                if payment_correction:
+                    cur_step.status = "failed"
+                    state.planner_repair_hints.append(payment_correction)
+                    state.internal_trace.append(
+                        {
+                            "role": "executor_strict",
+                            "step_id": cur_step.id,
+                            "planned_action": {
+                                "name": cur_action.name,
+                                "kwargs": cur_action.kwargs,
+                            },
+                            "result": "payment_validation_reject",
+                            "feedback": payment_correction,
+                        }
+                    )
+                    return ("give_up", cur_step, cur_action, False)
+
+            needs_critic = (
+                bool(new_step.needs_review_before_call)
+                or self._is_state_changing_tool(cur_action.name)
+                or bool(new_step.is_state_changing)
+            )
+            if not needs_critic:
+                return ("ok", cur_step, cur_action, False)
+
     # ---- Orchestrated solve loop ----
 
     def solve(
@@ -1199,19 +1443,23 @@ class MultiAgentV1(Agent):
             {"role": "user", "content": reset_resp.observation},
         ]
         state.original_user_request = reset_resp.observation
-        state.bound_slots = self._extract_bound_slots(state.original_user_request or "")
+        state.bound_slots = self._build_bound_slots(
+            state.original_user_request or "", state.info
+        )
         state.internal_trace.append(
             {
                 "role": "orchestrator_state",
                 "phase": SM_BIND_CONTEXT,
                 "bound_slots": dict(state.bound_slots),
+                "bound_sources": "task_info+opening_message",
             }
         )
         state.orchestrator_phase = SM_RUN
         last_source = "user"
         need_replan = True
+        consecutive_terminal_deferrals = 0
 
-        for _ in range(max_num_steps):
+        for outer_i in range(max_num_steps):
             if last_source == "user" and state.pending_plan_update:
                 user_response = state.executor_messages[-1].get("content", "")
                 proposed = state.pending_plan_update.get("proposed_plan")
@@ -1293,6 +1541,33 @@ class MultiAgentV1(Agent):
 
             step = self._get_active_step(state.approved_plan, state.active_step_id)
             if step is None:
+                remaining_outer = max_num_steps - outer_i - 1
+                force_terminal = (
+                    remaining_outer <= TERMINAL_GATE_MIN_REMAINING_OUTER_STEPS
+                    or consecutive_terminal_deferrals >= MAX_TERMINAL_DEFERRALS
+                )
+                if not force_terminal:
+                    consecutive_terminal_deferrals += 1
+                    state.planner_repair_hints.append(
+                        "Orchestrator: the current plan has no pending/in-progress step, "
+                        "but the episode likely is not finished. Emit a plan with concrete "
+                        "executable tool steps, or request_clarification with one focused "
+                        "question — do not end with an empty or all-completed step list "
+                        "unless the user's goal is fully satisfied."
+                    )
+                    state.internal_trace.append(
+                        {
+                            "role": "orchestrator_state",
+                            "phase": SM_RUN,
+                            "event": "defer_terminal_no_active_step",
+                            "remaining_outer_steps": remaining_outer,
+                            "consecutive_deferrals": consecutive_terminal_deferrals,
+                        }
+                    )
+                    need_replan = True
+                    continue
+
+                consecutive_terminal_deferrals = 0
                 state.orchestrator_phase = SM_TERMINAL_GATE
                 final_msg = self._compose_terminal_user_message(state)
                 state.internal_trace.append(
@@ -1364,36 +1639,22 @@ class MultiAgentV1(Agent):
 
             requires_review = bool(step.needs_review_before_call) or self._is_state_changing_tool(action.name) or bool(step.is_state_changing)
             if requires_review:
-                critic_result = self._get_critic().review_with_verification(
-                    orchestrator=self,
-                    state=state,
-                    action=action,
-                    env=env,
+                rc_status, step, action, rc_env_done = (
+                    self._critic_planner_reconcile_loop(state, env, step, action)
                 )
-                if not critic_result.get("approved", False):
-                    step.status = "failed"
-                    fb = critic_result.get("feedback_for_executor") or critic_result.get("reason", "Critic rejected action.")
-                    state.planner_repair_hints.append(fb)
-                    state.internal_trace.append(
-                        {
-                            "role": "critic_gate",
-                            "step_id": step.id,
-                            "planned_action": {"name": action.name, "kwargs": action.kwargs},
-                            "critic_result": critic_result,
-                            "result": "blocked",
-                        }
-                    )
+                if rc_status == "user_interrupted":
+                    last_source = "user"
+                    need_replan = True
+                    if rc_env_done:
+                        break
+                    continue
+                if rc_status == "give_up":
                     need_replan = True
                     continue
-                state.internal_trace.append(
-                    {
-                        "role": "critic_gate",
-                        "step_id": step.id,
-                        "planned_action": {"name": action.name, "kwargs": action.kwargs},
-                        "critic_result": critic_result,
-                        "result": "approved",
-                    }
-                )
+                if rc_status == "no_active_step":
+                    need_replan = True
+                    continue
+                # rc_status == "ok"
 
             env_resp = env.step(action)
             state.reward = env_resp.reward
@@ -1437,6 +1698,7 @@ class MultiAgentV1(Agent):
                     "tool_observation": (env_resp.observation or "")[:800],
                 }
             )
+            consecutive_terminal_deferrals = 0
 
             if self._is_tool_failure(env_resp.observation or ""):
                 step.status = "failed"
