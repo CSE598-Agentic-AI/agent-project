@@ -32,6 +32,8 @@ SM_TERMINAL_GATE = "terminal_gate"
 TERMINAL_GATE_MIN_REMAINING_OUTER_STEPS = 2
 # After this many deferrals in a row, run terminal anyway (avoid infinite replan).
 MAX_TERMINAL_DEFERRALS = 3
+# Cap unique planner repair hints (dedupe + drop oldest).
+MAX_PLANNER_REPAIR_HINTS = 12
 
 _FORBIDDEN_TERMINAL_SUBSTRINGS = (
     "i have completed all planned actions",
@@ -1184,6 +1186,43 @@ class MultiAgentV1(Agent):
         return False
 
     @staticmethod
+    def _kwargs_id_allowed_by_ground_truth(
+        key: str, val: str, state: "ConversationState"
+    ) -> bool:
+        """Allow ids from env task / bound_slots when the user message paraphrased them away."""
+        if not val or not str(val).strip():
+            return False
+        v = str(val).strip()
+        slots = getattr(state, "bound_slots", None) or {}
+        if not isinstance(slots, dict):
+            slots = {}
+        info = state.info if isinstance(state.info, dict) else {}
+        task = info.get("task") if isinstance(info.get("task"), dict) else None
+
+        if key == "user_id":
+            b = slots.get("user_id")
+            if b and v.lower() == str(b).strip().lower():
+                return True
+            if task and task.get("user_id"):
+                if v.lower() == str(task["user_id"]).strip().lower():
+                    return True
+        elif key == "reservation_id":
+            b = slots.get("reservation_id")
+            if b and v.upper() == str(b).strip().upper():
+                return True
+        elif key == "order_id":
+
+            def _norm_order(s: str) -> str:
+                t = str(s).strip().upper()
+                return t[1:] if t.startswith("#") else t
+
+            b = slots.get("order_id")
+            if b and _norm_order(v) == _norm_order(b):
+                return True
+
+        return False
+
+    @staticmethod
     def _validate_action(action: Action, state: "ConversationState") -> Dict[str, Any]:
         """Deterministic validation replacing the LLM critic.
         Checks that referenced IDs actually exist in conversation or tool results."""
@@ -1197,10 +1236,14 @@ class MultiAgentV1(Agent):
             if msg.get("role") in ("user", "tool"):
                 known_data += (msg.get("content") or "") + "\n"
 
-        for key in ("user_id", "order_id"):
+        for key in ("user_id", "order_id", "reservation_id"):
             if key in action.kwargs:
                 val = str(action.kwargs[key])
                 if val and val not in known_data:
+                    if MultiAgentV1._kwargs_id_allowed_by_ground_truth(
+                        key, val, state
+                    ):
+                        continue
                     return {
                         "approved": False,
                         "reason": f"{key} '{val}' not in conversation or tool results.",
@@ -1211,6 +1254,21 @@ class MultiAgentV1(Agent):
                     }
 
         return {"approved": True, "reason": "Validation passed."}
+
+    @staticmethod
+    def _append_planner_repair_hint(
+        state: "ConversationState", text: Optional[str]
+    ) -> None:
+        """Append a repair hint: dedupe exact repeats, keep at most MAX_PLANNER_REPAIR_HINTS."""
+        t = (text or "").strip()
+        if not t:
+            return
+        hints = state.planner_repair_hints
+        if t in hints:
+            hints.remove(t)
+        hints.append(t)
+        while len(hints) > MAX_PLANNER_REPAIR_HINTS:
+            hints.pop(0)
 
     @staticmethod
     def _message_to_action(message: Dict[str, Any]) -> Action:
@@ -1279,7 +1337,7 @@ class MultiAgentV1(Agent):
             fb = critic_result.get("feedback_for_executor") or critic_result.get(
                 "reason", "Critic rejected action."
             )
-            state.planner_repair_hints.append(fb)
+            MultiAgentV1._append_planner_repair_hint(state, fb)
             state.internal_trace.append(
                 {
                     "role": "critic_gate",
@@ -1377,10 +1435,11 @@ class MultiAgentV1(Agent):
             validation = self._validate_action(cur_action, state)
             if not validation.get("approved", True):
                 cur_step.status = "failed"
-                state.planner_repair_hints.append(
+                MultiAgentV1._append_planner_repair_hint(
+                    state,
                     validation.get(
                         "feedback_for_executor", "Validator rejected planned action."
-                    )
+                    ),
                 )
                 state.internal_trace.append(
                     {
@@ -1400,7 +1459,7 @@ class MultiAgentV1(Agent):
                 payment_correction = self._validate_payment_split(cur_action, state)
                 if payment_correction:
                     cur_step.status = "failed"
-                    state.planner_repair_hints.append(payment_correction)
+                    MultiAgentV1._append_planner_repair_hint(state, payment_correction)
                     state.internal_trace.append(
                         {
                             "role": "executor_strict",
@@ -1548,12 +1607,13 @@ class MultiAgentV1(Agent):
                 )
                 if not force_terminal:
                     consecutive_terminal_deferrals += 1
-                    state.planner_repair_hints.append(
+                    MultiAgentV1._append_planner_repair_hint(
+                        state,
                         "Orchestrator: the current plan has no pending/in-progress step, "
                         "but the episode likely is not finished. Emit a plan with concrete "
                         "executable tool steps, or request_clarification with one focused "
                         "question — do not end with an empty or all-completed step list "
-                        "unless the user's goal is fully satisfied."
+                        "unless the user's goal is fully satisfied.",
                     )
                     state.internal_trace.append(
                         {
@@ -1605,8 +1665,9 @@ class MultiAgentV1(Agent):
             validation = self._validate_action(action, state)
             if not validation.get("approved", True):
                 step.status = "failed"
-                state.planner_repair_hints.append(
-                    validation.get("feedback_for_executor", "Validator rejected planned action.")
+                MultiAgentV1._append_planner_repair_hint(
+                    state,
+                    validation.get("feedback_for_executor", "Validator rejected planned action."),
                 )
                 state.internal_trace.append(
                     {
@@ -1624,7 +1685,7 @@ class MultiAgentV1(Agent):
                 payment_correction = self._validate_payment_split(action, state)
                 if payment_correction:
                     step.status = "failed"
-                    state.planner_repair_hints.append(payment_correction)
+                    MultiAgentV1._append_planner_repair_hint(state, payment_correction)
                     state.internal_trace.append(
                         {
                             "role": "executor_strict",
@@ -1702,8 +1763,9 @@ class MultiAgentV1(Agent):
 
             if self._is_tool_failure(env_resp.observation or ""):
                 step.status = "failed"
-                state.planner_repair_hints.append(
-                    f"Tool {action.name} failed for step {step.id}: {(env_resp.observation or '')[:300]}"
+                MultiAgentV1._append_planner_repair_hint(
+                    state,
+                    f"Tool {action.name} failed for step {step.id}: {(env_resp.observation or '')[:300]}",
                 )
                 need_replan = True
             else:
