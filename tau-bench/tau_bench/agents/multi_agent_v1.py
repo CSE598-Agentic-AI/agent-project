@@ -18,85 +18,7 @@ from tau_bench.types import (
 )
 
 MAX_CRITIC_RETRIES = 2
-# After a critic reject, replan and re-review this many times before giving up
-# (does not consume outer max_num_steps; saves user/env turns).
-MAX_PLANNER_CRITIC_RECONCILE = 4
 READ_ONLY_PREFIXES = ("get_", "list_", "calculate", "think")
-
-# Top-level orchestration state machine (drives bind → run → mandatory terminal message).
-SM_BIND_CONTEXT = "bind_context"
-SM_RUN = "run"
-SM_TERMINAL_GATE = "terminal_gate"
-
-# Defer terminal composer until few outer iterations remain (avoids bogus mid-task closes).
-TERMINAL_GATE_MIN_REMAINING_OUTER_STEPS = 2
-# After this many deferrals in a row, run terminal anyway (avoid infinite replan).
-MAX_TERMINAL_DEFERRALS = 3
-# Cap unique planner repair hints (dedupe + drop oldest).
-MAX_PLANNER_REPAIR_HINTS = 12
-
-_FORBIDDEN_TERMINAL_SUBSTRINGS = (
-    "i have completed all planned actions",
-    "completed all planned actions",
-)
-
-# Short user messages that constitute confirmation of a previously-proposed action.
-CONFIRMATION_TOKENS = frozenset({
-    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "alright",
-    "go ahead", "proceed", "please do", "please proceed", "confirm",
-    "confirmed", "do it", "sounds good", "correct", "that's correct",
-    "that's right", "please", "go for it", "make it happen", "that works",
-    "i confirm", "i agree", "absolutely", "of course", "fine",
-})
-
-# Environment-changing tools: run LLM critic after deterministic validation passes.
-HIGH_STAKES_ACTION_NAMES = frozenset(
-    {
-        # Airline
-        "book_reservation",
-        "cancel_reservation",
-        "update_reservation_flights",
-        "update_reservation_passengers",
-        "update_reservation_baggages",
-        "send_certificate",
-        "transfer_to_human_agents",
-        # Retail
-        "cancel_pending_order",
-        "exchange_delivered_order_items",
-        "modify_pending_order_address",
-        "modify_pending_order_items",
-        "modify_pending_order_payment",
-        "return_delivered_order_items",
-        "modify_user_address",
-    }
-)
-
-FLIGHT_SEARCH_TOOL_NAMES = frozenset(
-    {"search_direct_flight", "search_onestop_flight"}
-)
-# How far back to look for a flight search before a user-facing respond (think() may sit in between).
-CRITIC_FLIGHT_SEARCH_LOOKBACK = 6
-
-# Phrases that indicate the executor is claiming failure after a search — worth critic review.
-_IMPOSSIBILITY_PHRASES = (
-    "no flights",
-    "none of the",
-    "couldn't find",
-    "could not find",
-    "no available",
-    "no options",
-    "no suitable",
-    "no direct flight",
-    "no one-stop",
-    "unable to find",
-    "unfortunately",
-    "doesn't meet",
-    "do not meet",
-    "does not meet",
-    "don't meet",
-    "not possible",
-    "cannot be handled",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -107,32 +29,18 @@ _IMPOSSIBILITY_PHRASES = (
 class PlanStep:
     id: str
     description: str
-    tool_name: str
-    tool_args: Dict[str, Any]
-    status: str  # pending | in_progress | done | failed
-    needs_review_before_call: bool = False
-    is_state_changing: bool = False
+    status: str  # pending | in_progress | done
 
 @dataclass
 class Plan:
     goal: str
-    plan_text: str
     steps: List[PlanStep]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "goal": self.goal,
-            "plan_text": self.plan_text,
             "steps": [
-                {
-                    "id": s.id,
-                    "description": s.description,
-                    "tool_name": s.tool_name,
-                    "tool_args": s.tool_args,
-                    "status": s.status,
-                    "needs_review_before_call": s.needs_review_before_call,
-                    "is_state_changing": s.is_state_changing,
-                }
+                {"id": s.id, "description": s.description, "status": s.status}
                 for s in self.steps
             ],
         }
@@ -141,18 +49,11 @@ class Plan:
     def from_dict(cls, d: Dict[str, Any]) -> "Plan":
         return cls(
             goal=d.get("goal", ""),
-            plan_text=d.get("plan_text", ""),
             steps=[
                 PlanStep(
                     id=s["id"],
                     description=s["description"],
-                    tool_name=s["tool_name"],
-                    tool_args=s.get("tool_args", {}),
                     status=s.get("status", "pending"),
-                    needs_review_before_call=bool(
-                        s.get("needs_review_before_call", False)
-                    ),
-                    is_state_changing=bool(s.get("is_state_changing", False)),
                 )
                 for s in d.get("steps", [])
             ],
@@ -179,24 +80,18 @@ class ConversationState:
     reward: float = 0.0
     completed_tool_calls: List[CompletedToolCall] = field(default_factory=list)
     original_user_request: str = ""
-    planner_repair_hints: List[str] = field(default_factory=list)
-    # State machine: bind_context runs once; run is the planner/execute loop; terminal_gate
-    # emits a mandatory user-facing closing message when the plan has no active step.
-    orchestrator_phase: str = SM_BIND_CONTEXT
-    bound_slots: Dict[str, str] = field(default_factory=dict)
-    executor_mode: str = "normal"
 
 
 # ---------------------------------------------------------------------------
 # Role prompts
 # ---------------------------------------------------------------------------
 
-PLANNER_INSTRUCTION = """You are a planning agent for a customer-service workflow.
+PLANNER_INSTRUCTION = """You are a planning agent for a customer service system.
 
 # Domain Policy
 {wiki}
 
-# Available Tools (authoritative)
+# Available Tools
 {tools}
 
 # Current Approved Plan
@@ -205,32 +100,20 @@ PLANNER_INSTRUCTION = """You are a planning agent for a customer-service workflo
 # Pending Plan Update (awaiting user confirmation)
 {pending_update}
 
-# Planner Repair Hints (from critic/tool failures)
-{repair_hints}
-
-# Pre-bound context (parsed from the opening user message — authoritative for tool args)
-{bound_context}
-
 # Conversation So Far
 {conversation}
 
-# Required JSON output (no markdown, no extra text)
+# Instructions
+Analyze the conversation and decide how to proceed with the plan.
+
+You MUST respond with ONLY valid JSON (no markdown, no extra text) in this exact format:
 {{
   "decision": "continue_existing_plan" | "propose_plan_change" | "request_clarification",
-  "reason": "brief reason",
+  "reason": "Brief explanation of your decision",
   "plan": {{
-    "goal": "overall goal",
-    "plan_text": "human readable plan summary",
+    "goal": "The overall goal based on the user request",
     "steps": [
-      {{
-        "id": "s1",
-        "description": "what this step does",
-        "tool_name": "exact tool name",
-        "tool_args": {{}},
-        "status": "pending",
-        "needs_review_before_call": false,
-        "is_state_changing": false
-      }}
+      {{"id": "s1", "description": "Step description", "status": "pending"}}
     ]
   }},
   "active_step_id": "s1",
@@ -238,48 +121,31 @@ PLANNER_INSTRUCTION = """You are a planning agent for a customer-service workflo
 }}
 
 Rules:
-- Every step MUST map to exactly one tool call with exact parameters.
-- Use only tools listed in Available Tools.
-- "tool_name" must be exact and executable by orchestrator.
-- "tool_args" must be exact JSON object.
-- Mark "is_state_changing" true for mutation tools (book/cancel/update/modify/return/exchange/send/transfer).
-- If uncertain about state-change classification, set needs_review_before_call=true.
-- If user materially changes request, use propose_plan_change with confirmation_question.
-- If information is missing, use request_clarification with confirmation_question.
-- Never output vague non-executable steps.
-- If Pre-bound context lists user_id, reservation_id, or order_id, you MUST use those exact values in tool_args (never *_placeholder or made-up ids).
-"""
-
-TERMINAL_COMPOSER_INSTRUCTION = """You write exactly ONE assistant message to the user.
-
-The automated plan has no further executable tool steps for this turn. Your message must close the interaction usefully.
-
-# Domain policy (follow for tone and constraints)
-{wiki}
-
-# Original user request (opening message)
-{original_request}
-
-# Tool calls completed this session (summaries)
-{completed_tools}
-
-# Most recent tool raw result (truncated)
-{last_tool_blob}
-
-# Recent visible assistant/user text (abbreviated)
-{recent_dialog}
-
-# Required JSON only (no markdown)
-{{
-  "terminal_kind": "summary_done" | "clarify_needed" | "policy_block" | "handoff",
-  "message": "plain text to show the user"
-}}
-
-Rules:
-- Do NOT say you "completed all planned actions" or any generic automation meta phrase.
-- Be specific: cite reservation ids, flight numbers, or outcomes when they appear in the context above.
-- If nothing was accomplished and the user still needs help, use clarify_needed with one minimal question.
-- If transfer_to_human_agents was invoked in the session, use handoff and confirm escalation briefly.
+- If there is no existing plan, create one and use "continue_existing_plan".
+- If the user's latest message materially changes the goal, constraints, or approach, \
+use "propose_plan_change" and set "confirmation_question" to ask for confirmation.
+- IMPORTANT: Reducing the scope of the plan (e.g. dropping items the user originally \
+asked about, handling fewer requests than originally stated) is a MATERIAL plan change \
+that requires "propose_plan_change" with user confirmation. Never silently drop user \
+requests from the plan.
+- If you just need to progress through existing steps, use "continue_existing_plan" and \
+update step statuses accordingly.
+- Step status updates (pending -> in_progress -> done) do NOT require user confirmation.
+- If a pending plan update exists and the user confirmed it, apply the change and return \
+"continue_existing_plan" with the updated plan.
+- If a pending plan update exists and the user rejected it, return "continue_existing_plan" \
+with the original plan unchanged.
+- If you need more information to proceed, use "request_clarification" and set \
+"confirmation_question" to your question.
+- The "plan" field must ALWAYS be present.
+- When the user mentions a fallback preference (e.g. "if X isn't available, I'll take Y"), \
+include that fallback in the plan steps so it is not lost.
+- MULTIPLE REQUEST TYPES: If the user asks for more than one different type of action in the \
+same request (e.g. return AND exchange, cancel AND modify, return AND cancel), use \
+"request_clarification" and ask the user to give one request at a time. For example: \
+"I can help with both the exchange and the return. To keep things clear, could you tell me \
+which you'd like to do first? We'll complete that one, then handle the other." Do not create \
+a plan that mixes multiple action types in one go — get the user to choose one first.
 """
 
 EXECUTOR_SYSTEM_TEMPLATE = """{wiki}
@@ -320,17 +186,6 @@ explanations, tell the user you cannot help with this request without authentica
 "I want X, but if X is unavailable I'll take Y", and you discover X is unavailable, \
 apply the fallback Y directly. Do NOT present other alternatives that differ from what \
 the user explicitly stated as their fallback.
-- CONSTRAINT CHECK BEFORE OFFERS OR BOOKING: When the user states hard limits (e.g. \
-"not before 11am", "after 3pm", "same day only", "economy only"), filter flight or itinerary \
-options so you NEVER present or book an option that violates those limits. Among options \
-that satisfy ALL hard constraints, apply the user's tie-breakers (e.g. lowest price, \
-shortest total time). If no option satisfies the constraints, say so and search again or \
-ask a minimal clarifying question.
-- EXECUTE IMMEDIATELY: When you have decided on an action and have all required information, \
-call the tool in THIS response. NEVER write a message that says "I will now…", "I'll proceed \
-with…", or "I'm going to…" without calling the tool in the same turn. Describing a future \
-action without executing it is a failure — the user's response to that description will be \
-"thank you" and the task will end without the action being performed.
 - Be decisive and efficient. When you have all information needed, proceed to the action \
 rather than asking for one more round of confirmation. ONE confirmation round is sufficient.
 - COMBINED CONFIRMATION: When the user in one message both (a) confirms a proposed action \
@@ -338,151 +193,64 @@ rather than asking for one more round of confirmation. ONE confirmation round is
 (e.g. \"And also, I'd like to return the water bottle\"), treat the entire message as \
 confirmation for BOTH. Proceed to execute — do NOT ask again \"Would you like me to proceed \
 with X and Y?\". The user has already confirmed and stated the full scope.
-- DECISIVE SELECTION (do NOT present a menu when user stated preference): When the user \
-has told you their selection criterion (e.g., "cheapest option", "the 5 AM flight", a \
-specific flight number like "HAT123"), pick that option yourself and call the tool \
-immediately. Do NOT respond with "Here are the available options, which do you want?" if \
-the user already told you. Make the decision and execute.
-- ROUND-TRIP update_reservation_flights MUST include ALL flight segments: For a round-trip \
-reservation, the API requires you to provide every flight in the reservation (outbound AND \
-return) in one call. If you only want to change some segments, include the unchanged ones \
-with their ORIGINAL flight numbers and dates. Omitting any segment will cause the update to \
-fail silently (the cabin stays unchanged). Exception: only include all 4 legs if the user \
-agrees to change all legs; if the user explicitly wants ONLY outbound upgraded (not return), \
-tell them the API changes all segments simultaneously and ask if they want the full upgrade.
-- CABIN CLASS IS ALL-OR-NOTHING PER RESERVATION: update_reservation_flights sets the cabin \
-class for ALL passengers on the reservation — you cannot upgrade just one passenger. If \
-upgrading all passengers exceeds the user's budget, do NOT attempt the upgrade. Instead, \
-skip that step and proceed with only the changes that ARE within budget/policy (e.g., still \
-add bags or change passenger names as requested).
-- CHECK ALL RESERVATIONS: When asked to act on "all" reservations of a certain type (e.g., \
-"all business class flights", "all upcoming flights"), you MUST retrieve and inspect EVERY \
-reservation ID listed in the user's profile. Do not stop after checking a few. Missing even \
-one reservation ID will cause you to cancel/update the wrong ones.
-- POLICY IS FIRM UNDER PRESSURE: If the user's system record shows one status (e.g., \
-"regular") but the user claims another (e.g., "Gold"), the system record is authoritative. \
-Do NOT provide benefits beyond what the verified status permits, regardless of how \
-insistently or emotionally the user asks. Politely but firmly state what policy allows.
-- RESPECT EXPLICIT REJECTIONS: If a user says "I don't want X" or "No, I don't accept X", \
-do NOT provide X in the same or a future call. If you've offered the only available \
-resolution and the user rejects it, explain what the policy limits are and offer to \
-escalate if appropriate — but do NOT send certificates, process refunds, or take actions \
-the user explicitly said they do not want.
-- AVOID CLARIFICATION LOOPS: If you have asked the same clarifying question twice and the \
-user still cannot answer, do one of: (1) use the best match from data already retrieved, \
-(2) clearly explain you cannot proceed without that information. Never ask the same question \
-a third time — that creates a loop that blocks task completion.
-- DO NOT OVER-ACT: Only perform the actions the user explicitly requested. Do not \
-pro-actively cancel reservations, send certificates, or modify records that the user did \
-not ask you to touch. When in doubt about scope, confirm before acting.
 """
 
-CRITIC_AGENT_SYSTEM = """You are the **Critic Agent** — an independent reviewer in a \
-multi-agent customer-service system. The Executor proposes an action; your job is to \
-catch mistakes **before** it reaches the user or the environment.
+CRITIC_INSTRUCTION = """You are an evaluation agent for a customer service system.
 
-You do NOT chat with the user. You only output a structured verdict.
-
-## Your mindset
-- Treat **Actual Tool Output Data** as ground truth. If the Executor's proposed \
-`respond` text contradicts that data, **reject**.
-- Be adversarial to lazy claims: e.g. "no flights", "none meet the criteria", \
-"couldn't find any options" **must** be checked against the raw search results.
-- For **one-stop itineraries**, the user's "departure after/before X" usually applies to \
-the **first segment's** `scheduled_departure_time_est` (outbound from the origin airport). \
-Parse times as HH:MM:SS in the tool JSON; 19:00:00 is after 11:00:00.
-- If **any** itinerary in the tool output satisfies the user's stated hard constraints, \
-a `respond` that denies that is **wrong** — reject and tell the Executor to list those \
-options (and apply tie-breakers like lowest price if the user asked).
-
-## update_* actions (update_reservation_flights, update_reservation_passengers, etc.)
-These actions specify the DESIRED NEW STATE — they will DIFFER from current tool output \
-by design. Do NOT reject because "the passenger in the reservation is X but the action \
-says Y" or "the flight in the reservation is A but the action proposes B". The entire \
-point of an update is to change something. Only reject if: (a) the reservation_id is \
-wrong, (b) a hard policy rule is violated (e.g. basic economy can't change flights), or \
-(c) the data in the action was never mentioned by the user or in any tool result.
-
-## Basic economy — what IS and IS NOT restricted
-- `update_reservation_flights`: BLOCKED for basic economy (cannot change flight routes).
-- `update_reservation_baggages`: ALLOWED — baggage counts are NOT restricted by cabin class.
-- `update_reservation_passengers`: ALLOWED — passenger changes are NOT restricted by cabin class.
-- `update_reservation_cabin`: ALLOWED — cabin upgrades are NOT restricted by basic economy.
-Do NOT reject update_reservation_baggages or update_reservation_passengers just because \
-the reservation is in basic economy. Only reject update_reservation_flights for basic economy.
-
-## Round-trip flight updates
-A round-trip reservation has TWO flight segments (outbound + return). When \
-update_reservation_flights is called for a round-trip, it is EXPECTED and CORRECT to \
-include both segments — even if the user only wants to change one leg. Including both is \
-required by the tool. Do NOT reject because "you included the outbound flight" or \
-"why is the return flight in there". Only reject if a specific flight number was never \
-mentioned by the user or found in search results.
-
-## update_reservation_flights — payment field
-This tool uses a `payment_id` field (a single string like "certificate_0" or \
-"gift_card_1"), NOT a `payment_methods` array. If the action has a valid `payment_id` \
-string, do NOT reject citing "wrong payment format". Only reject if the `payment_id` \
-value was never seen in conversation or tool results.
-
-## transfer_to_human_agents
-Reject if the only obstacle is that the Executor misread tool output, searched the \
-wrong dates, or failed to match an existing reservation that is already in \
-**Actual Tool Output Data**. Transfer only when the request is truly out of scope or \
-impossible after **correctly** using the data.
-
-## cancel / book / modify
-- Reject if IDs or payment methods were never seen in conversation or tool results.
-- Reject flight bookings that violate user-stated time windows when compared to the \
-proposed flight list in arguments.
-
-## Domain policy
+# Domain Policy
 {wiki}
 
-You MUST respond with ONLY valid JSON (no markdown, no extra text). \
-Your response schema is defined in the user payload and supports:
-- final decision (approve/reject), or
-- request_read_tool to fetch additional read-only evidence.
+# Original User Request
+{original_request}
+
+# Current Plan
+{plan_summary}
+
+# Active Step
+{active_step}
+
+# Tool Calls Already Completed (these are FACTS, do not ask to redo them)
+{completed_tools}
+
+# Actual Tool Output Data (raw results from completed tool calls)
+{tool_output_data}
+
+# Proposed Action
+Tool: {action_name}
+Arguments: {action_args}
+
+# Recent Conversation Context
+{recent_context}
+
+# Instructions
+Evaluate whether the proposed action is appropriate. Consider:
+1. Does the action align with the current plan step?
+2. Does the action follow the domain policy?
+3. Is the action safe and correct (right arguments, right tool)?
+4. If this is a response to the user, is it accurate and complete?
+5. Does the action still serve the user's ORIGINAL request? If the plan has narrowed \
+scope (e.g. handling fewer items than originally requested), reject and flag it.
+6. IMPORTANT: If a tool call uses arguments (names, emails, IDs, etc.) that the user \
+never provided in the conversation, reject it as hallucinated data.
+
+CRITICAL RULES:
+- If a tool call has ALREADY been completed (see "Tool Calls Already Completed"), \
+do NOT reject an action just because you think that step hasn't happened yet. \
+Trust the completed tool call records as ground truth.
+- Do NOT make factual claims about product availability, pricing, or data unless \
+you can verify it from the "Actual Tool Output Data" above. If you don't have data \
+to confirm or deny something, APPROVE the action and let the tool call resolve it.
+- When in doubt about factual data, APPROVE. Only reject when you have concrete \
+evidence from the tool outputs or conversation that the action is wrong.
+
+You MUST respond with ONLY valid JSON (no markdown, no extra text):
+{{
+  "approved": true,
+  "reason": "Why you approved or rejected",
+  "feedback_for_executor": null,
+  "risk_level": "low"
+}}
 """
-
-
-def _parse_json_response(content: str) -> Optional[Dict[str, Any]]:
-    """Best-effort JSON extraction: raw → fenced block → first brace pair."""
-    if not content:
-        return None
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        pass
-    m = re.search(r"```(?:json)?\s*(.*?)\s*```", content, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    start = content.find("{")
-    if start != -1:
-        depth = 0
-        for i in range(start, len(content)):
-            if content[i] == "{":
-                depth += 1
-            elif content[i] == "}":
-                depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(content[start : i + 1])
-                except json.JSONDecodeError:
-                    break
-    return None
-
-
-def _is_user_confirmation(text: str) -> bool:
-    """Return True when a short user message is clearly an affirmative confirmation."""
-    stripped = text.strip().lower()
-    # Long messages almost always contain new information/instructions, not pure confirmation.
-    if len(stripped.split()) > 15:
-        return False
-    return any(tok in stripped for tok in CONFIRMATION_TOKENS)
 
 
 # ---------------------------------------------------------------------------
@@ -514,243 +282,38 @@ class MultiAgentV1(Agent):
         self.critic_provider = critic_provider or provider
         self.max_critic_retries = max_critic_retries
         self._tools_str = json.dumps(tools_info, indent=2)
-        self._critic_agent: Optional["CriticAgent"] = None
 
-    def _get_critic(self) -> "CriticAgent":
-        if self._critic_agent is None:
-            self._critic_agent = CriticAgent(
-                wiki=self.wiki,
-                model=self.critic_model,
-                provider=self.critic_provider,
-                temperature=self.temperature,
-            )
-        return self._critic_agent
+    # ---- JSON helpers ----
 
     @staticmethod
-    def _extract_bound_slots(opening_text: str) -> Dict[str, str]:
-        """Parse common identifiers from the simulator user's opening message."""
-        if not opening_text:
-            return {}
-        slots: Dict[str, str] = {}
-        m = re.search(r"(?i)\byour\s+user\s+id\s+is\s+([a-z0-9_]+)\b", opening_text)
-        if m:
-            slots["user_id"] = m.group(1).lower()
-        else:
-            m2 = re.search(r"(?i)\buser\s+id\s+is\s+([a-z0-9_]+)\b", opening_text)
-            if m2:
-                slots["user_id"] = m2.group(1).lower()
-        rm = re.search(
-            r"(?i)\breservation(?:\s+id)?\s+([A-Z0-9]{4,10})\b",
-            opening_text,
-        )
-        if rm:
-            slots["reservation_id"] = rm.group(1).upper()
-        om = re.search(r"(?i)\border\s+(#[A-Z0-9]{4,}|[A-Z0-9]{5,})\b", opening_text)
-        if om:
-            raw = om.group(1)
-            slots["order_id"] = raw if raw.startswith("#") else f"#{raw.upper()}"
-        return slots
-
-    @staticmethod
-    def _build_bound_slots(
-        original_user_message: str, info: Dict[str, Any]
-    ) -> Dict[str, str]:
-        """Bind slots from env task metadata (authoritative) plus NL fallbacks.
-
-        Task.user_id and task.instruction come from reset ``info`` (ground truth).
-        The user-facing opening message may paraphrase; use it only to fill gaps.
-        """
-        slots: Dict[str, str] = {}
-        task = info.get("task") if isinstance(info, dict) else None
-        if isinstance(task, dict):
-            uid = task.get("user_id")
-            if uid:
-                slots["user_id"] = str(uid).strip().lower()
-            instruction = task.get("instruction") or ""
-            inst_slots = MultiAgentV1._extract_bound_slots(instruction)
-            if "reservation_id" in inst_slots:
-                slots["reservation_id"] = inst_slots["reservation_id"]
-            if "order_id" in inst_slots:
-                slots["order_id"] = inst_slots["order_id"]
-            if "user_id" not in slots and "user_id" in inst_slots:
-                slots["user_id"] = inst_slots["user_id"]
-        obs_slots = MultiAgentV1._extract_bound_slots(original_user_message or "")
-        for key, val in obs_slots.items():
-            if key not in slots:
-                slots[key] = val
-        return slots
-
-    @staticmethod
-    def _format_bound_context_for_planner(bound_slots: Dict[str, str]) -> str:
-        if not bound_slots:
-            return (
-                "(none extracted from opening message — obtain ids from the user or "
-                "tools as usual.)"
-            )
-        lines = [
-            "Parsed from the **first user message**. Use these in `tool_args` when applicable;",
-            "never use placeholders like `user_id_placeholder`.",
-        ]
-        for k, v in bound_slots.items():
-            lines.append(f"- **{k}**: `{v}`")
-        return "\n".join(lines)
-
-    def _apply_bound_slots_to_plan(self, state: ConversationState) -> None:
-        """Fill obvious placeholder tool args from bound slots (deterministic repair)."""
-        plan = state.approved_plan
-        if plan is None:
-            return
-        uid = state.bound_slots.get("user_id")
-        rid = state.bound_slots.get("reservation_id")
-        for s in plan.steps:
-            if not isinstance(s.tool_args, dict):
-                continue
-            if uid:
-                v = s.tool_args.get("user_id")
-                if isinstance(v, str) and (
-                    v.strip().lower() in ("user_id_placeholder", "placeholder", "")
-                ):
-                    s.tool_args["user_id"] = uid
-            if rid:
-                v2 = s.tool_args.get("reservation_id")
-                if isinstance(v2, str) and (
-                    v2.strip().lower()
-                    in ("reservation_id_placeholder", "placeholder", "")
-                ):
-                    s.tool_args["reservation_id"] = rid
-            oid = state.bound_slots.get("order_id")
-            if oid:
-                v3 = s.tool_args.get("order_id")
-                if isinstance(v3, str) and v3.strip().lower() in (
-                    "order_id_placeholder",
-                    "placeholder",
-                    "",
-                ):
-                    s.tool_args["order_id"] = oid
-
-    @staticmethod
-    def _is_forbidden_terminal_message(text: str) -> bool:
-        t = (text or "").strip().lower()
-        if not t:
-            return True
-        return any(sub in t for sub in _FORBIDDEN_TERMINAL_SUBSTRINGS)
-
-    @staticmethod
-    def _terminal_fallback_message(state: ConversationState) -> str:
-        names = [tc.name for tc in state.completed_tool_calls]
-        if "transfer_to_human_agents" in names:
-            return (
-                "I've escalated this to a human specialist who can continue helping you "
-                "with the details we discussed."
-            )
-        if not state.completed_tool_calls:
-            return (
-                "I wasn't able to run further automated steps toward your request yet. "
-                "What should I focus on next—booking, an existing reservation, or "
-                "something else?"
-            )
-        last = state.completed_tool_calls[-1]
-        snippet = (last.result_summary or last.full_result or "")[:240].strip()
-        if snippet:
-            return (
-                f"Here's where we paused after `{last.name}`: {snippet}\n\n"
-                "Tell me if you want to continue from here or adjust the request."
-            )
-        return f"The last step was `{last.name}`. Tell me how you'd like to proceed."
-
-    def _call_terminal_composer(self, state: ConversationState) -> Optional[str]:
-        last_blob = "None"
-        if state.completed_tool_calls:
-            tc = state.completed_tool_calls[-1]
-            last_blob = (tc.full_result or tc.result_summary or "")[:3500]
-        recent = state.executor_messages[-16:]
-        dialog = self._format_conversation_for_planner(recent)
-        prompt = TERMINAL_COMPOSER_INSTRUCTION.format(
-            wiki=self.wiki[:12000],
-            original_request=(state.original_user_request or "")[:4000],
-            completed_tools=self._format_completed_tools(state.completed_tool_calls),
-            last_tool_blob=last_blob,
-            recent_dialog=dialog,
-        )
-        messages = [
-            {"role": "system", "content": prompt},
-            {
-                "role": "user",
-                "content": "Produce the closing JSON for the user now.",
-            },
-        ]
-        api_base = os.getenv("AGENT_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
-        api_key = os.getenv("AGENT_MODEL_API_KEY") or os.getenv("OPENAI_API_KEY")
-        total_cost = 0.0
-        parsed: Optional[Dict[str, Any]] = None
-        raw_output = ""
-        for _ in range(2):
-            res = completion(
-                model=self.model,
-                custom_llm_provider=self.provider,
-                messages=messages,
-                temperature=self.temperature,
-                api_base=api_base,
-                api_key=api_key,
-            )
-            cost = res._hidden_params.get("response_cost", 0) or 0
-            total_cost += cost
-            content = res.choices[0].message.content or ""
-            raw_output = content
-            parsed = _parse_json_response(content)
-            if (
-                parsed
-                and isinstance(parsed.get("message"), str)
-                and parsed["message"].strip()
-            ):
-                break
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "Invalid. Return JSON with non-empty message string only.",
-                }
-            )
-            parsed = None
-        state.total_cost += total_cost
-        state.internal_trace.append(
-            {
-                "role": "terminal_composer",
-                "raw_output": raw_output,
-                "parsed": parsed,
-                "cost": total_cost,
-            }
-        )
-        if not parsed or not isinstance(parsed.get("message"), str):
+    def _parse_json_response(content: str) -> Optional[Dict[str, Any]]:
+        """Best-effort JSON extraction: raw → fenced block → first brace pair."""
+        if not content:
             return None
-        return parsed["message"].strip()
-
-    def _compose_terminal_user_message(self, state: ConversationState) -> str:
-        candidate = self._call_terminal_composer(state)
-        if candidate and not self._is_forbidden_terminal_message(candidate):
-            return candidate
-        state.internal_trace.append(
-            {
-                "role": "orchestrator_state",
-                "phase": SM_TERMINAL_GATE,
-                "note": "terminal_composer_unusable_or_forbidden; used_fallback",
-            }
-        )
-        return self._terminal_fallback_message(state)
-
-    @staticmethod
-    def should_run_critic_review(
-        action: Action, state: ConversationState
-    ) -> bool:
-        if action.name in HIGH_STAKES_ACTION_NAMES:
-            return True
-        # Only run critic on respond if it makes an impossibility claim after a flight search.
-        if action.name == RESPOND_ACTION_NAME and state.completed_tool_calls:
-            tail = state.completed_tool_calls[-CRITIC_FLIGHT_SEARCH_LOOKBACK:]
-            if any(tc.name in FLIGHT_SEARCH_TOOL_NAMES for tc in tail):
-                text = (action.kwargs.get(RESPOND_ACTION_FIELD_NAME) or "").lower()
-                if any(phrase in text for phrase in _IMPOSSIBILITY_PHRASES):
-                    return True
-        return False
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            pass
+        m = re.search(r"```(?:json)?\s*(.*?)\s*```", content, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except json.JSONDecodeError:
+                pass
+        start = content.find("{")
+        if start != -1:
+            depth = 0
+            for i in range(start, len(content)):
+                if content[i] == "{":
+                    depth += 1
+                elif content[i] == "}":
+                    depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(content[start : i + 1])
+                    except json.JSONDecodeError:
+                        break
+        return None
 
     # ---- Formatting helpers ----
 
@@ -759,12 +322,9 @@ class MultiAgentV1(Agent):
         if plan is None:
             return "No plan yet."
         markers = {"pending": "[ ]", "in_progress": "[>]", "done": "[x]"}
-        lines = [f"Goal: {plan.goal}", f"Plan: {plan.plan_text}"]
+        lines = [f"Goal: {plan.goal}"]
         for s in plan.steps:
-            lines.append(
-                f"  {markers.get(s.status, '[ ]')} {s.id}: {s.description} :: "
-                f"{s.tool_name}({json.dumps(s.tool_args)[:120]})"
-            )
+            lines.append(f"  {markers.get(s.status, '[ ]')} {s.id}: {s.description}")
         return "\n".join(lines)
 
     @staticmethod
@@ -844,19 +404,11 @@ class MultiAgentV1(Agent):
             if state.pending_plan_update
             else "None"
         )
-        repair_hints = (
-            "\n".join(f"- {h}" for h in state.planner_repair_hints[-8:])
-            if state.planner_repair_hints
-            else "None"
-        )
-        bound_context = self._format_bound_context_for_planner(state.bound_slots)
         prompt = PLANNER_INSTRUCTION.format(
             wiki=self.wiki,
             tools=self._tools_str,
             current_plan=self._format_plan(state.approved_plan),
             pending_update=pending_str,
-            repair_hints=repair_hints,
-            bound_context=bound_context,
             conversation=self._format_conversation_for_planner(
                 state.executor_messages
             ),
@@ -870,95 +422,42 @@ class MultiAgentV1(Agent):
         ]
         api_base = os.getenv("AGENT_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
         api_key = os.getenv("AGENT_MODEL_API_KEY") or os.getenv("OPENAI_API_KEY")
-        parsed: Optional[Dict[str, Any]] = None
-        raw_output = ""
-        total_cost = 0.0
-        for _ in range(2):
-            res = completion(
-                model=self.planner_model,
-                custom_llm_provider=self.planner_provider,
-                messages=messages,
-                temperature=self.temperature,
-                api_base=api_base,
-                api_key=api_key,
-            )
-            cost = res._hidden_params.get("response_cost", 0) or 0
-            total_cost += cost
-            content = res.choices[0].message.content or ""
-            raw_output = content
-            parsed = _parse_json_response(content)
-            if parsed is not None and self._is_valid_planner_result(parsed):
-                break
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Your previous output was invalid or non-executable. "
-                        "Return valid JSON with executable step objects exactly as specified."
-                    ),
-                }
-            )
-            parsed = None
+        res = completion(
+            model=self.planner_model,
+            custom_llm_provider=self.planner_provider,
+            messages=messages,
+            temperature=self.temperature,
+            api_base=api_base,
+            api_key=api_key,
+        )
+        cost = res._hidden_params.get("response_cost", 0) or 0
+        state.total_cost += cost
 
-        state.total_cost += total_cost
+        content = res.choices[0].message.content or ""
+        parsed = self._parse_json_response(content)
         state.internal_trace.append(
-            {
-                "role": "planner",
-                "raw_output": raw_output,
-                "parsed": parsed,
-                "cost": total_cost,
-            }
+            {"role": "planner", "raw_output": content, "parsed": parsed, "cost": cost}
         )
 
-        if parsed is None or not self._is_valid_planner_result(parsed):
+        if parsed is None:
             return {
                 "decision": "continue_existing_plan",
                 "reason": "Failed to parse planner output, continuing.",
                 "plan": (
                     state.approved_plan.to_dict()
                     if state.approved_plan
-                    else {"goal": "Help the user", "plan_text": "", "steps": []}
+                    else {"goal": "Help the user", "steps": []}
                 ),
                 "active_step_id": state.active_step_id,
                 "confirmation_question": None,
             }
         return parsed
 
-    @staticmethod
-    def _is_valid_planner_result(result: Dict[str, Any]) -> bool:
-        if not isinstance(result, dict):
-            return False
-        if "decision" not in result or "plan" not in result:
-            return False
-        plan = result.get("plan")
-        if not isinstance(plan, dict):
-            return False
-        steps = plan.get("steps")
-        if not isinstance(steps, list):
-            return False
-        for s in steps:
-            if not isinstance(s, dict):
-                return False
-            required = ("id", "description", "tool_name", "tool_args", "status")
-            if any(k not in s for k in required):
-                return False
-            if not isinstance(s.get("tool_args"), dict):
-                return False
-        return True
-
     def _call_executor(
         self,
         state: ConversationState,
         extra_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[Dict[str, Any], Action, float]:
-        mode_instruction = ""
-        if state.executor_mode == "execute_action":
-            mode_instruction = (
-                "\n\n**⚡ EXECUTE-ACTION MODE**: The user confirmed or a prior step just "
-                "completed. You MUST call a tool in this response. Do NOT write a text "
-                "response, acknowledgment, or description of what you will do. Identify "
-                "the tool required by the active plan step and call it NOW."
-            )
         system_prompt = EXECUTOR_SYSTEM_TEMPLATE.format(
             wiki=self.wiki,
             plan_summary=self._format_plan(state.approved_plan),
@@ -966,7 +465,7 @@ class MultiAgentV1(Agent):
                 state.approved_plan, state.active_step_id
             ),
             completed_tools=self._format_completed_tools(state.completed_tool_calls),
-        ) + mode_instruction
+        )
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt}
         ]
@@ -998,6 +497,67 @@ class MultiAgentV1(Agent):
         )
         return msg, action, cost
 
+    def _call_critic(
+        self, state: ConversationState, action: Action
+    ) -> Dict[str, Any]:
+        recent = state.executor_messages[-16:]
+        prompt = CRITIC_INSTRUCTION.format(
+            wiki=self.wiki,
+            original_request=state.original_user_request[:500],
+            plan_summary=self._format_plan(state.approved_plan),
+            active_step=self._get_active_step_description(
+                state.approved_plan, state.active_step_id
+            ),
+            completed_tools=self._format_completed_tools(
+                state.completed_tool_calls
+            ),
+            tool_output_data=self._format_tool_output_data(
+                state.completed_tool_calls
+            ),
+            action_name=action.name,
+            action_args=json.dumps(action.kwargs, indent=2),
+            recent_context=self._format_conversation_for_planner(recent),
+        )
+        messages = [
+            {"role": "system", "content": prompt},
+            {
+                "role": "user",
+                "content": "Evaluate the proposed action and return your assessment as JSON.",
+            },
+        ]
+        api_base = os.getenv("AGENT_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
+        api_key = os.getenv("AGENT_MODEL_API_KEY") or os.getenv("OPENAI_API_KEY")
+        res = completion(
+            model=self.critic_model,
+            custom_llm_provider=self.critic_provider,
+            messages=messages,
+            temperature=self.temperature,
+            api_base=api_base,
+            api_key=api_key,
+        )
+        cost = res._hidden_params.get("response_cost", 0) or 0
+        state.total_cost += cost
+
+        content = res.choices[0].message.content or ""
+        parsed = self._parse_json_response(content)
+        state.internal_trace.append(
+            {
+                "role": "critic",
+                "action_reviewed": {"name": action.name, "kwargs": action.kwargs},
+                "raw_output": content,
+                "parsed": parsed,
+                "cost": cost,
+            }
+        )
+        if parsed is None:
+            return {
+                "approved": True,
+                "reason": "Critic output unparseable, approving by default.",
+                "feedback_for_executor": None,
+                "risk_level": "medium",
+            }
+        return parsed
+
     # ---- Helpers ----
 
     @staticmethod
@@ -1010,217 +570,6 @@ class MultiAgentV1(Agent):
             "that's not", "that is not", "i didn't", "i did not",
         ]
         return any(n in low for n in negations) or low in ("no", "nope", "nah")
-
-    @staticmethod
-    def _is_state_changing_tool(tool_name: str) -> bool:
-        return tool_name in HIGH_STAKES_ACTION_NAMES
-
-    @staticmethod
-    def _is_read_only_tool(tool_name: str) -> bool:
-        return tool_name.startswith(READ_ONLY_PREFIXES)
-
-    @staticmethod
-    def _get_active_step(plan: Optional[Plan], step_id: Optional[str]) -> Optional[PlanStep]:
-        if plan is None:
-            return None
-        if step_id:
-            for s in plan.steps:
-                if s.id == step_id and s.status in ("pending", "in_progress"):
-                    return s
-        for s in plan.steps:
-            if s.status in ("pending", "in_progress"):
-                return s
-        return None
-
-    @staticmethod
-    def _has_open_steps(plan: Optional[Plan]) -> bool:
-        return bool(plan and any(s.status in ("pending", "in_progress") for s in plan.steps))
-
-    @staticmethod
-    def _next_step(plan: Optional[Plan], current_id: Optional[str]) -> Optional[PlanStep]:
-        if plan is None:
-            return None
-        seen = current_id is None
-        for s in plan.steps:
-            if not seen and s.id == current_id:
-                seen = True
-                continue
-            if seen and s.status == "pending":
-                return s
-        return None
-
-    @staticmethod
-    def _is_tool_failure(observation: str) -> bool:
-        low = (observation or "").strip().lower()
-        return (
-            low.startswith("error")
-            or "failed" in low
-            or "not found" in low
-            or "invalid" in low
-            or "unable to" in low
-        )
-
-    @staticmethod
-    def _extract_user_details(state: "ConversationState") -> Optional[Dict[str, Any]]:
-        """Return parsed get_user_details result from the most recent call."""
-        for tc in reversed(state.completed_tool_calls):
-            if tc.name == "get_user_details" and tc.full_result:
-                try:
-                    return json.loads(tc.full_result)
-                except Exception:
-                    pass
-        return None
-
-    @staticmethod
-    def _compute_payment_split(
-        profile: Dict[str, Any],
-        total_amount: float,
-    ) -> Optional[List[Dict[str, Any]]]:
-        """Policy-compliant split: ≤1 certificate, ≤3 gift cards, ≤1 credit card.
-        Certificates used first (largest), then gift cards (largest first), then credit card."""
-        pms = profile.get("payment_methods", {})
-        certificates, gift_cards, credit_cards = [], [], []
-        for pid, pm in pms.items():
-            src = pm.get("source", "")
-            if src == "certificate":
-                certificates.append((pm.get("amount", 0), pid))
-            elif src == "gift_card":
-                gift_cards.append((pm.get("amount", 0), pid))
-            elif src == "credit_card":
-                credit_cards.append(pid)
-
-        certificates.sort(reverse=True)
-        gift_cards.sort(reverse=True)
-
-        result: List[Dict[str, Any]] = []
-        remaining = round(float(total_amount), 2)
-
-        if certificates and remaining > 0:
-            amt, pid = certificates[0]
-            use = round(min(amt, remaining), 2)
-            result.append({"payment_id": pid, "amount": use})
-            remaining = round(remaining - use, 2)
-
-        for amt, pid in gift_cards[:3]:
-            if remaining <= 0:
-                break
-            use = round(min(amt, remaining), 2)
-            if use > 0:
-                result.append({"payment_id": pid, "amount": use})
-                remaining = round(remaining - use, 2)
-
-        if remaining > 0.01 and credit_cards:
-            result.append({"payment_id": credit_cards[0], "amount": round(remaining, 2)})
-            remaining = 0.0
-
-        return result if remaining <= 0.01 else None
-
-    @staticmethod
-    def _validate_payment_split(
-        action: Action, state: "ConversationState"
-    ) -> Optional[str]:
-        """Returns a correction message if the proposed payment split violates policy,
-        else None (no correction needed)."""
-        if action.name != "book_reservation":
-            return None
-        proposed_pms = action.kwargs.get("payment_methods")
-        if not proposed_pms or not isinstance(proposed_pms, list):
-            return None
-
-        profile = MultiAgentV1._extract_user_details(state)
-        if not profile:
-            return None
-
-        total = round(sum(pm.get("amount", 0) for pm in proposed_pms), 2)
-        if total <= 0:
-            return None
-
-        correct = MultiAgentV1._compute_payment_split(profile, total)
-        if not correct:
-            return None
-
-        def _sig(pms):
-            return sorted((pm["payment_id"], pm["amount"]) for pm in pms)
-
-        if _sig(proposed_pms) == _sig(correct):
-            return None  # already correct
-
-        correct_lines = "\n".join(
-            f"  - {pm['payment_id']}: ${pm['amount']}" for pm in correct
-        )
-        return (
-            f"[PaymentSplitter] The proposed payment split for ${total} is wrong. "
-            f"Policy: ≤1 certificate (largest first), ≤3 gift cards (largest first), "
-            f"≤1 credit card for remainder.\n"
-            f"Correct split:\n{correct_lines}\n"
-            "Use EXACTLY these payment_methods in your next booking call."
-        )
-
-    @staticmethod
-    def _ensure_active_step_in_progress(state: "ConversationState") -> None:
-        """Planner often leaves the active step as pending; executor needs in_progress."""
-        if not state.approved_plan or not state.active_step_id:
-            return
-        for s in state.approved_plan.steps:
-            if s.id == state.active_step_id and s.status == "pending":
-                s.status = "in_progress"
-                return
-
-    @staticmethod
-    def _advance_active_step(state: "ConversationState") -> bool:
-        """If the current active step is 'done', advance active_step_id to the next
-        pending/in_progress step. Returns True if advanced."""
-        if not state.approved_plan or not state.active_step_id:
-            return False
-        current = next(
-            (s for s in state.approved_plan.steps if s.id == state.active_step_id),
-            None,
-        )
-        if current is None or current.status != "done":
-            return False
-        for s in state.approved_plan.steps:
-            if s.status == "pending":
-                s.status = "in_progress"
-                state.active_step_id = s.id
-                return True
-        return False
-
-    @staticmethod
-    def _kwargs_id_allowed_by_ground_truth(
-        key: str, val: str, state: "ConversationState"
-    ) -> bool:
-        """Allow ids from env task / bound_slots when the user message paraphrased them away."""
-        if not val or not str(val).strip():
-            return False
-        v = str(val).strip()
-        slots = getattr(state, "bound_slots", None) or {}
-        if not isinstance(slots, dict):
-            slots = {}
-        info = state.info if isinstance(state.info, dict) else {}
-        task = info.get("task") if isinstance(info.get("task"), dict) else None
-
-        if key == "user_id":
-            b = slots.get("user_id")
-            if b and v.lower() == str(b).strip().lower():
-                return True
-            if task and task.get("user_id"):
-                if v.lower() == str(task["user_id"]).strip().lower():
-                    return True
-        elif key == "reservation_id":
-            b = slots.get("reservation_id")
-            if b and v.upper() == str(b).strip().upper():
-                return True
-        elif key == "order_id":
-
-            def _norm_order(s: str) -> str:
-                t = str(s).strip().upper()
-                return t[1:] if t.startswith("#") else t
-
-            b = slots.get("order_id")
-            if b and _norm_order(v) == _norm_order(b):
-                return True
-
-        return False
 
     @staticmethod
     def _validate_action(action: Action, state: "ConversationState") -> Dict[str, Any]:
@@ -1236,14 +585,10 @@ class MultiAgentV1(Agent):
             if msg.get("role") in ("user", "tool"):
                 known_data += (msg.get("content") or "") + "\n"
 
-        for key in ("user_id", "order_id", "reservation_id"):
+        for key in ("user_id", "order_id"):
             if key in action.kwargs:
                 val = str(action.kwargs[key])
                 if val and val not in known_data:
-                    if MultiAgentV1._kwargs_id_allowed_by_ground_truth(
-                        key, val, state
-                    ):
-                        continue
                     return {
                         "approved": False,
                         "reason": f"{key} '{val}' not in conversation or tool results.",
@@ -1254,21 +599,6 @@ class MultiAgentV1(Agent):
                     }
 
         return {"approved": True, "reason": "Validation passed."}
-
-    @staticmethod
-    def _append_planner_repair_hint(
-        state: "ConversationState", text: Optional[str]
-    ) -> None:
-        """Append a repair hint: dedupe exact repeats, keep at most MAX_PLANNER_REPAIR_HINTS."""
-        t = (text or "").strip()
-        if not t:
-            return
-        hints = state.planner_repair_hints
-        if t in hints:
-            hints.remove(t)
-        hints.append(t)
-        while len(hints) > MAX_PLANNER_REPAIR_HINTS:
-            hints.pop(0)
 
     @staticmethod
     def _message_to_action(message: Dict[str, Any]) -> Action:
@@ -1287,208 +617,13 @@ class MultiAgentV1(Agent):
             kwargs={RESPOND_ACTION_FIELD_NAME: message.get("content", "")},
         )
 
-    def _critic_planner_reconcile_loop(
-        self,
-        state: ConversationState,
-        env: Env,
-        step: PlanStep,
-        action: Action,
-    ) -> Tuple[str, PlanStep, Action, bool]:
-        """Run critic → on reject, call planner again → new step/action → repeat until
-        critic approves, a non-reviewed action is produced, max rounds, or user-facing
-        planner decision.
-
-        Returns:
-            (status, step, action, env_done) with status in:
-            - ``ok``: critic approved (or replan produced an action that needs no review)
-            - ``give_up``: exceeded reconcile rounds or validation failed after replan
-            - ``user_interrupted``: request_clarification / propose_plan_change sent to user
-            - ``no_active_step``: planner left no executable step (outer loop should replan / terminal)
-
-            ``env_done`` is True only when ``user_interrupted`` and env.step reported done.
-        """
-        reject_count = 0
-        cur_step = step
-        cur_action = action
-
-        while True:
-            critic_result = self._get_critic().review_with_verification(
-                orchestrator=self,
-                state=state,
-                action=cur_action,
-                env=env,
-            )
-            if critic_result.get("approved", False):
-                state.internal_trace.append(
-                    {
-                        "role": "critic_gate",
-                        "step_id": cur_step.id,
-                        "planned_action": {
-                            "name": cur_action.name,
-                            "kwargs": cur_action.kwargs,
-                        },
-                        "critic_result": critic_result,
-                        "result": "approved",
-                    }
-                )
-                return ("ok", cur_step, cur_action, False)
-
-            cur_step.status = "failed"
-            fb = critic_result.get("feedback_for_executor") or critic_result.get(
-                "reason", "Critic rejected action."
-            )
-            MultiAgentV1._append_planner_repair_hint(state, fb)
-            state.internal_trace.append(
-                {
-                    "role": "critic_gate",
-                    "step_id": cur_step.id,
-                    "planned_action": {
-                        "name": cur_action.name,
-                        "kwargs": cur_action.kwargs,
-                    },
-                    "critic_result": critic_result,
-                    "result": "blocked",
-                }
-            )
-
-            reject_count += 1
-            if reject_count > MAX_PLANNER_CRITIC_RECONCILE:
-                return ("give_up", cur_step, cur_action, False)
-
-            state.internal_trace.append(
-                {
-                    "role": "planner_critic_reconcile",
-                    "attempt": reject_count,
-                    "event": "replan_after_critic_reject",
-                }
-            )
-
-            planner_result = self._call_planner(state)
-            decision = planner_result.get("decision", "continue_existing_plan")
-            plan_data = planner_result.get("plan")
-
-            if decision == "request_clarification":
-                question = planner_result.get(
-                    "confirmation_question",
-                    "Could you provide more details to continue?",
-                )
-                env_resp = env.step(
-                    Action(
-                        name=RESPOND_ACTION_NAME,
-                        kwargs={RESPOND_ACTION_FIELD_NAME: question},
-                    )
-                )
-                state.reward = env_resp.reward
-                state.info = {**state.info, **env_resp.info.model_dump()}
-                state.executor_messages.extend(
-                    [
-                        {"role": "assistant", "content": question},
-                        {"role": "user", "content": env_resp.observation},
-                    ]
-                )
-                return ("user_interrupted", cur_step, cur_action, env_resp.done)
-
-            if decision == "propose_plan_change":
-                state.pending_plan_update = {
-                    "proposed_plan": plan_data,
-                    "active_step_id": planner_result.get("active_step_id"),
-                    "reason": planner_result.get("reason", ""),
-                }
-                question = planner_result.get(
-                    "confirmation_question",
-                    "Please confirm the updated plan.",
-                )
-                env_resp = env.step(
-                    Action(
-                        name=RESPOND_ACTION_NAME,
-                        kwargs={RESPOND_ACTION_FIELD_NAME: question},
-                    )
-                )
-                state.reward = env_resp.reward
-                state.info = {**state.info, **env_resp.info.model_dump()}
-                state.executor_messages.extend(
-                    [
-                        {"role": "assistant", "content": question},
-                        {"role": "user", "content": env_resp.observation},
-                    ]
-                )
-                return ("user_interrupted", cur_step, cur_action, env_resp.done)
-
-            if plan_data and isinstance(plan_data, dict):
-                state.approved_plan = Plan.from_dict(plan_data)
-                self._apply_bound_slots_to_plan(state)
-            state.active_step_id = planner_result.get(
-                "active_step_id", state.active_step_id
-            )
-
-            new_step = self._get_active_step(
-                state.approved_plan, state.active_step_id
-            )
-            if new_step is None:
-                return ("no_active_step", cur_step, cur_action, False)
-
-            new_step.status = "in_progress"
-            state.active_step_id = new_step.id
-            cur_action = Action(name=new_step.tool_name, kwargs=new_step.tool_args)
-            cur_step = new_step
-
-            validation = self._validate_action(cur_action, state)
-            if not validation.get("approved", True):
-                cur_step.status = "failed"
-                MultiAgentV1._append_planner_repair_hint(
-                    state,
-                    validation.get(
-                        "feedback_for_executor", "Validator rejected planned action."
-                    ),
-                )
-                state.internal_trace.append(
-                    {
-                        "role": "executor_strict",
-                        "step_id": cur_step.id,
-                        "planned_action": {
-                            "name": cur_action.name,
-                            "kwargs": cur_action.kwargs,
-                        },
-                        "result": "validation_reject",
-                        "feedback": validation.get("feedback_for_executor"),
-                    }
-                )
-                return ("give_up", cur_step, cur_action, False)
-
-            if cur_action.name == "book_reservation":
-                payment_correction = self._validate_payment_split(cur_action, state)
-                if payment_correction:
-                    cur_step.status = "failed"
-                    MultiAgentV1._append_planner_repair_hint(state, payment_correction)
-                    state.internal_trace.append(
-                        {
-                            "role": "executor_strict",
-                            "step_id": cur_step.id,
-                            "planned_action": {
-                                "name": cur_action.name,
-                                "kwargs": cur_action.kwargs,
-                            },
-                            "result": "payment_validation_reject",
-                            "feedback": payment_correction,
-                        }
-                    )
-                    return ("give_up", cur_step, cur_action, False)
-
-            needs_critic = (
-                bool(new_step.needs_review_before_call)
-                or self._is_state_changing_tool(cur_action.name)
-                or bool(new_step.is_state_changing)
-            )
-            if not needs_critic:
-                return ("ok", cur_step, cur_action, False)
-
     # ---- Orchestrated solve loop ----
 
     def solve(
         self,
         env: Env,
         task_index: Optional[int] = None,
-        max_num_steps: int = 40,
+        max_num_steps: int = 30,
     ) -> SolveResult:
         reset_resp = env.reset(task_index=task_index)
         state = ConversationState()
@@ -1502,45 +637,72 @@ class MultiAgentV1(Agent):
             {"role": "user", "content": reset_resp.observation},
         ]
         state.original_user_request = reset_resp.observation
-        state.bound_slots = self._build_bound_slots(
-            state.original_user_request or "", state.info
-        )
-        state.internal_trace.append(
-            {
-                "role": "orchestrator_state",
-                "phase": SM_BIND_CONTEXT,
-                "bound_slots": dict(state.bound_slots),
-                "bound_sources": "task_info+opening_message",
-            }
-        )
-        state.orchestrator_phase = SM_RUN
-        last_source = "user"
-        need_replan = True
-        consecutive_terminal_deferrals = 0
 
-        for outer_i in range(max_num_steps):
+        last_source = "user"
+        plan_change_proposals = 0
+
+        for _ in range(max_num_steps):
+            # ---------- AUTO-APPLY PENDING PLAN CONFIRMATION ----------
             if last_source == "user" and state.pending_plan_update:
-                user_response = state.executor_messages[-1].get("content", "")
+                user_response = (
+                    state.executor_messages[-1].get("content", "")
+                    if state.executor_messages
+                    else ""
+                )
                 proposed = state.pending_plan_update.get("proposed_plan")
-                if (
-                    not self._is_rejection(user_response)
-                    and proposed
-                    and isinstance(proposed, dict)
-                ):
+                if not self._is_rejection(user_response) and proposed and isinstance(proposed, dict):
                     state.approved_plan = Plan.from_dict(proposed)
-                    state.active_step_id = state.pending_plan_update.get("active_step_id")
-                    self._apply_bound_slots_to_plan(state)
                 state.pending_plan_update = None
 
-            if need_replan or last_source == "user" or not self._has_open_steps(state.approved_plan):
+            # ---------- PLANNER PHASE (runs on every user message) ----------
+            if last_source == "user":
                 planner_result = self._call_planner(state)
                 decision = planner_result.get("decision", "continue_existing_plan")
                 plan_data = planner_result.get("plan")
 
+                if decision == "propose_plan_change":
+                    plan_change_proposals += 1
+                    if plan_change_proposals > 2:
+                        if plan_data and isinstance(plan_data, dict):
+                            state.approved_plan = Plan.from_dict(plan_data)
+                        state.pending_plan_update = None
+                        state.active_step_id = planner_result.get(
+                            "active_step_id", state.active_step_id
+                        )
+                    else:
+                        state.pending_plan_update = {
+                            "proposed_plan": plan_data,
+                            "reason": planner_result.get("reason", ""),
+                        }
+                        question = planner_result.get(
+                            "confirmation_question",
+                            "Could you confirm you'd like me to proceed with this updated plan?",
+                        )
+                        env_resp = env.step(
+                            Action(
+                                name=RESPOND_ACTION_NAME,
+                                kwargs={RESPOND_ACTION_FIELD_NAME: question},
+                            )
+                        )
+                        state.reward = env_resp.reward
+                        state.info = {**state.info, **env_resp.info.model_dump()}
+                        state.executor_messages.extend(
+                            [
+                                {"role": "assistant", "content": question},
+                                {"role": "user", "content": env_resp.observation},
+                            ]
+                        )
+                        last_source = "user"
+                        if env_resp.done:
+                            break
+                        continue
+                else:
+                    plan_change_proposals = 0
+
                 if decision == "request_clarification":
                     question = planner_result.get(
                         "confirmation_question",
-                        "Could you provide more details to continue?",
+                        "Could you provide more details about your request?",
                     )
                     env_resp = env.step(
                         Action(
@@ -1557,226 +719,115 @@ class MultiAgentV1(Agent):
                         ]
                     )
                     last_source = "user"
-                    need_replan = True
                     if env_resp.done:
                         break
                     continue
 
-                if decision == "propose_plan_change":
-                    state.pending_plan_update = {
-                        "proposed_plan": plan_data,
-                        "active_step_id": planner_result.get("active_step_id"),
-                        "reason": planner_result.get("reason", ""),
-                    }
-                    question = planner_result.get(
-                        "confirmation_question",
-                        "Please confirm the updated plan.",
-                    )
-                    env_resp = env.step(
-                        Action(
-                            name=RESPOND_ACTION_NAME,
-                            kwargs={RESPOND_ACTION_FIELD_NAME: question},
-                        )
-                    )
-                    state.reward = env_resp.reward
-                    state.info = {**state.info, **env_resp.info.model_dump()}
-                    state.executor_messages.extend(
-                        [
-                            {"role": "assistant", "content": question},
-                            {"role": "user", "content": env_resp.observation},
-                        ]
-                    )
-                    last_source = "user"
-                    need_replan = False
-                    if env_resp.done:
-                        break
-                    continue
-
+                # continue_existing_plan
                 if plan_data and isinstance(plan_data, dict):
                     state.approved_plan = Plan.from_dict(plan_data)
-                    self._apply_bound_slots_to_plan(state)
-                state.active_step_id = planner_result.get("active_step_id", state.active_step_id)
-                need_replan = False
-
-            step = self._get_active_step(state.approved_plan, state.active_step_id)
-            if step is None:
-                remaining_outer = max_num_steps - outer_i - 1
-                force_terminal = (
-                    remaining_outer <= TERMINAL_GATE_MIN_REMAINING_OUTER_STEPS
-                    or consecutive_terminal_deferrals >= MAX_TERMINAL_DEFERRALS
+                state.pending_plan_update = None
+                state.active_step_id = planner_result.get(
+                    "active_step_id", state.active_step_id
                 )
-                if not force_terminal:
-                    consecutive_terminal_deferrals += 1
-                    MultiAgentV1._append_planner_repair_hint(
-                        state,
-                        "Orchestrator: the current plan has no pending/in-progress step, "
-                        "but the episode likely is not finished. Emit a plan with concrete "
-                        "executable tool steps, or request_clarification with one focused "
-                        "question — do not end with an empty or all-completed step list "
-                        "unless the user's goal is fully satisfied.",
-                    )
-                    state.internal_trace.append(
-                        {
-                            "role": "orchestrator_state",
-                            "phase": SM_RUN,
-                            "event": "defer_terminal_no_active_step",
-                            "remaining_outer_steps": remaining_outer,
-                            "consecutive_deferrals": consecutive_terminal_deferrals,
-                        }
-                    )
-                    need_replan = True
-                    continue
 
-                consecutive_terminal_deferrals = 0
-                state.orchestrator_phase = SM_TERMINAL_GATE
-                final_msg = self._compose_terminal_user_message(state)
-                state.internal_trace.append(
+            # ---------- EXECUTOR + VALIDATION PHASE ----------
+            action: Optional[Action] = None
+            executor_msg: Optional[Dict[str, Any]] = None
+            retry_context: List[Dict[str, Any]] = []
+
+            for attempt in range(self.max_critic_retries + 1):
+                executor_msg, action, cost = self._call_executor(
+                    state, extra_messages=retry_context or None
+                )
+                state.total_cost += cost
+
+                validation = self._validate_action(action, state)
+                if validation.get("approved", True):
+                    break
+                feedback = validation.get(
+                    "feedback_for_executor",
+                    "Please reconsider your action.",
+                )
+                retry_context.append(
                     {
-                        "role": "orchestrator_state",
-                        "phase": SM_TERMINAL_GATE,
-                        "message_preview": (final_msg or "")[:400],
+                        "role": "user",
+                        "content": (
+                            f"[Validator] Your proposed action was rejected: "
+                            f"{feedback}. Please try a different approach."
+                        ),
                     }
                 )
-                env_resp = env.step(
-                    Action(
-                        name=RESPOND_ACTION_NAME,
-                        kwargs={RESPOND_ACTION_FIELD_NAME: final_msg},
+            else:
+                action = Action(
+                    name=RESPOND_ACTION_NAME,
+                    kwargs={
+                        RESPOND_ACTION_FIELD_NAME: (
+                            "I want to make sure I handle your request correctly. "
+                            "Could you please clarify or confirm what you'd like me to do?"
+                        )
+                    },
+                )
+                executor_msg = {
+                    "role": "assistant",
+                    "content": action.kwargs[RESPOND_ACTION_FIELD_NAME],
+                }
+
+            # ---------- EXECUTE ACTION ----------
+            assert action is not None and executor_msg is not None
+            env_resp = env.step(action)
+            state.reward = env_resp.reward
+            state.info = {**state.info, **env_resp.info.model_dump()}
+
+            if action.name != RESPOND_ACTION_NAME:
+                state.completed_tool_calls.append(
+                    CompletedToolCall(
+                        name=action.name,
+                        kwargs=action.kwargs,
+                        result_summary=(env_resp.observation or "")[:200],
+                        full_result=env_resp.observation or "",
                     )
                 )
-                state.reward = env_resp.reward
-                state.info = {**state.info, **env_resp.info.model_dump()}
+                if executor_msg.get("tool_calls"):
+                    executor_msg["tool_calls"] = executor_msg["tool_calls"][:1]
+                    state.executor_messages.extend(
+                        [
+                            executor_msg,
+                            {
+                                "role": "tool",
+                                "tool_call_id": executor_msg["tool_calls"][0]["id"],
+                                "name": executor_msg["tool_calls"][0]["function"][
+                                    "name"
+                                ],
+                                "content": env_resp.observation,
+                            },
+                        ]
+                    )
+                else:
+                    state.executor_messages.append(
+                        {
+                            "role": "user",
+                            "content": f"API output: {env_resp.observation}",
+                        }
+                    )
+                last_source = "tool"
+            else:
+                content = action.kwargs.get(RESPOND_ACTION_FIELD_NAME, "")
                 state.executor_messages.extend(
                     [
-                        {"role": "assistant", "content": final_msg},
+                        {"role": "assistant", "content": content},
                         {"role": "user", "content": env_resp.observation},
                     ]
                 )
                 last_source = "user"
-                if env_resp.done:
-                    break
-                need_replan = True
-                state.orchestrator_phase = SM_RUN
-                continue
 
-            step.status = "in_progress"
-            state.active_step_id = step.id
-            action = Action(name=step.tool_name, kwargs=step.tool_args)
+                # Mark active step done after responding to user
+                if state.approved_plan and state.active_step_id:
+                    for s in state.approved_plan.steps:
+                        if s.id == state.active_step_id and s.status == "in_progress":
+                            s.status = "done"
+                            break
 
-            validation = self._validate_action(action, state)
-            if not validation.get("approved", True):
-                step.status = "failed"
-                MultiAgentV1._append_planner_repair_hint(
-                    state,
-                    validation.get("feedback_for_executor", "Validator rejected planned action."),
-                )
-                state.internal_trace.append(
-                    {
-                        "role": "executor_strict",
-                        "step_id": step.id,
-                        "planned_action": {"name": action.name, "kwargs": action.kwargs},
-                        "result": "validation_reject",
-                        "feedback": validation.get("feedback_for_executor"),
-                    }
-                )
-                need_replan = True
-                continue
-
-            if action.name == "book_reservation":
-                payment_correction = self._validate_payment_split(action, state)
-                if payment_correction:
-                    step.status = "failed"
-                    MultiAgentV1._append_planner_repair_hint(state, payment_correction)
-                    state.internal_trace.append(
-                        {
-                            "role": "executor_strict",
-                            "step_id": step.id,
-                            "planned_action": {"name": action.name, "kwargs": action.kwargs},
-                            "result": "payment_validation_reject",
-                            "feedback": payment_correction,
-                        }
-                    )
-                    need_replan = True
-                    continue
-
-            requires_review = bool(step.needs_review_before_call) or self._is_state_changing_tool(action.name) or bool(step.is_state_changing)
-            if requires_review:
-                rc_status, step, action, rc_env_done = (
-                    self._critic_planner_reconcile_loop(state, env, step, action)
-                )
-                if rc_status == "user_interrupted":
-                    last_source = "user"
-                    need_replan = True
-                    if rc_env_done:
-                        break
-                    continue
-                if rc_status == "give_up":
-                    need_replan = True
-                    continue
-                if rc_status == "no_active_step":
-                    need_replan = True
-                    continue
-                # rc_status == "ok"
-
-            env_resp = env.step(action)
-            state.reward = env_resp.reward
-            state.info = {**state.info, **env_resp.info.model_dump()}
-            state.completed_tool_calls.append(
-                CompletedToolCall(
-                    name=action.name,
-                    kwargs=action.kwargs,
-                    result_summary=(env_resp.observation or "")[:200],
-                    full_result=env_resp.observation or "",
-                )
-            )
-            state.executor_messages.extend(
-                [
-                    {
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "id": f"strict-{step.id}",
-                                "function": {
-                                    "name": action.name,
-                                    "arguments": json.dumps(action.kwargs),
-                                },
-                            }
-                        ],
-                    },
-                    {
-                        "role": "tool",
-                        "tool_call_id": f"strict-{step.id}",
-                        "name": action.name,
-                        "content": env_resp.observation,
-                    },
-                ]
-            )
-            state.internal_trace.append(
-                {
-                    "role": "executor_strict",
-                    "step_id": step.id,
-                    "planned_action": {"name": action.name, "kwargs": action.kwargs},
-                    "result": "executed",
-                    "tool_observation": (env_resp.observation or "")[:800],
-                }
-            )
-            consecutive_terminal_deferrals = 0
-
-            if self._is_tool_failure(env_resp.observation or ""):
-                step.status = "failed"
-                MultiAgentV1._append_planner_repair_hint(
-                    state,
-                    f"Tool {action.name} failed for step {step.id}: {(env_resp.observation or '')[:300]}",
-                )
-                need_replan = True
-            else:
-                step.status = "done"
-                nxt = self._next_step(state.approved_plan, step.id)
-                if nxt is not None:
-                    nxt.status = "pending" if nxt.status == "failed" else nxt.status
-                    state.active_step_id = nxt.id
-                need_replan = False
-
-            last_source = "tool"
             if env_resp.done:
                 break
 
@@ -1786,233 +837,3 @@ class MultiAgentV1(Agent):
             info={**state.info, "multi_agent_trace": state.internal_trace},
             total_cost=state.total_cost,
         )
-
-
-class CriticAgent:
-    """Independent LLM agent that reviews the Executor's proposed action before env step.
-
-    Invoked by ``MultiAgentV1`` for high-stakes tools, transfers to human, and for
-    user-facing ``respond`` immediately after flight search tool results (where false
-    negatives like "no flights" are common).
-    """
-
-    def __init__(
-        self,
-        wiki: str,
-        model: str,
-        provider: str,
-        temperature: float = 0.0,
-    ) -> None:
-        self.wiki = wiki
-        self.model = model
-        self.provider = provider
-        self.temperature = temperature
-
-    def _review_once(
-        self,
-        orchestrator: "MultiAgentV1",
-        state: ConversationState,
-        action: Action,
-        verification_observations: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        recent = state.executor_messages[-20:]
-        tool_blob = orchestrator._format_tool_output_data(
-            state.completed_tool_calls,
-            max_per_tool=4500,
-            max_total=18000,
-        )
-        verification_blob = json.dumps(verification_observations or [], indent=2)[:8000]
-        system_prompt = CRITIC_AGENT_SYSTEM.format(wiki=self.wiki)
-        user_payload = f"""# Original User Request (task opening user message)
-{state.original_user_request[:4000]}
-
-# Current Plan
-{orchestrator._format_plan(state.approved_plan)}
-
-# Active Step
-{orchestrator._get_active_step_description(state.approved_plan, state.active_step_id)}
-
-# Tool Calls Already Completed (summaries)
-{orchestrator._format_completed_tools(state.completed_tool_calls)}
-
-# Actual Tool Output Data (raw JSON from tools — authoritative)
-{tool_blob}
-
-# Additional verification reads performed during this critic pass
-{verification_blob}
-
-# Proposed action
-Tool name: {action.name}
-Arguments (JSON):
-{json.dumps(action.kwargs, indent=2)}
-
-# Recent conversation (abbreviated)
-{orchestrator._format_conversation_for_planner(recent)}
-
-You may return one of:
-1) Final verdict:
-{{
-  "decision": "approve" | "reject",
-  "reason": "...",
-  "feedback_for_executor": null | "...",
-  "evidence": null | "..."
-}}
-2) Verification request:
-{{
-  "decision": "request_read_tool",
-  "reason": "...",
-  "read_tool": {{"name": "get_.../list_.../search_.../calculate/think", "kwargs": {{...}}}}
-}}
-
-Only request read-only tools. Do not request mutation tools.
-
-Return your verdict as a single JSON object only."""
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_payload},
-        ]
-        api_base = os.getenv("AGENT_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
-        api_key = os.getenv("AGENT_MODEL_API_KEY") or os.getenv("OPENAI_API_KEY")
-        res = completion(
-            model=self.model,
-            custom_llm_provider=self.provider,
-            messages=messages,
-            temperature=self.temperature,
-            api_base=api_base,
-            api_key=api_key,
-        )
-        cost = res._hidden_params.get("response_cost", 0) or 0
-        state.total_cost += cost
-
-        content = res.choices[0].message.content or ""
-        parsed = _parse_json_response(content)
-        state.internal_trace.append(
-            {
-                "role": "critic_agent",
-                "agent": "CriticAgent",
-                "action_reviewed": {"name": action.name, "kwargs": action.kwargs},
-                "raw_output": content,
-                "parsed": parsed,
-                "cost": cost,
-            }
-        )
-        if parsed is None:
-            return {
-                "decision": "approve",
-                "reason": "Critic agent output unparseable; approving.",
-                "feedback_for_executor": None,
-                "evidence": None,
-            }
-        return parsed
-
-    def review_with_verification(
-        self,
-        orchestrator: "MultiAgentV1",
-        state: ConversationState,
-        action: Action,
-        env: Env,
-        max_iterations: int = 8,
-    ) -> Dict[str, Any]:
-        verification_observations: List[Dict[str, Any]] = []
-        for i in range(max_iterations):
-            verdict = self._review_once(
-                orchestrator=orchestrator,
-                state=state,
-                action=action,
-                verification_observations=verification_observations,
-            )
-            decision = (verdict.get("decision") or "").lower()
-            if decision in ("approve", "reject"):
-                return {
-                    "approved": decision == "approve",
-                    "reason": verdict.get("reason", ""),
-                    "feedback_for_executor": verdict.get("feedback_for_executor"),
-                    "evidence": verdict.get("evidence"),
-                }
-            if decision != "request_read_tool":
-                return {
-                    "approved": False,
-                    "reason": "Critic returned invalid decision.",
-                    "feedback_for_executor": "Critic output invalid. Replan required.",
-                    "evidence": None,
-                }
-            read_tool = verdict.get("read_tool") or {}
-            name = read_tool.get("name")
-            kwargs = read_tool.get("kwargs") or {}
-            if not name or not isinstance(kwargs, dict):
-                return {
-                    "approved": False,
-                    "reason": "Critic requested malformed read tool call.",
-                    "feedback_for_executor": "Critic verification malformed. Replan required.",
-                    "evidence": None,
-                }
-            if not orchestrator._is_read_only_tool(name):
-                return {
-                    "approved": False,
-                    "reason": f"Critic requested non-read tool '{name}'.",
-                    "feedback_for_executor": "Critic attempted mutation during verification.",
-                    "evidence": None,
-                }
-
-            env_resp = env.step(Action(name=name, kwargs=kwargs))
-            state.reward = env_resp.reward
-            state.info = {**state.info, **env_resp.info.model_dump()}
-            state.completed_tool_calls.append(
-                CompletedToolCall(
-                    name=name,
-                    kwargs=kwargs,
-                    result_summary=(env_resp.observation or "")[:200],
-                    full_result=env_resp.observation or "",
-                )
-            )
-            state.executor_messages.extend(
-                [
-                    {
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "id": f"critic-read-{i}",
-                                "function": {
-                                    "name": name,
-                                    "arguments": json.dumps(kwargs),
-                                },
-                            }
-                        ],
-                    },
-                    {
-                        "role": "tool",
-                        "tool_call_id": f"critic-read-{i}",
-                        "name": name,
-                        "content": env_resp.observation,
-                    },
-                ]
-            )
-            verification_observations.append(
-                {
-                    "tool_name": name,
-                    "kwargs": kwargs,
-                    "observation": (env_resp.observation or "")[:5000],
-                }
-            )
-            state.internal_trace.append(
-                {
-                    "role": "critic_verification_tool",
-                    "requested_tool": {"name": name, "kwargs": kwargs},
-                    "observation": (env_resp.observation or "")[:1200],
-                }
-            )
-            if env_resp.done:
-                return {
-                    "approved": False,
-                    "reason": "Environment ended during critic verification.",
-                    "feedback_for_executor": "Unable to continue; environment terminated.",
-                    "evidence": None,
-                }
-
-        return {
-            "approved": False,
-            "reason": "Critic verification exceeded max iterations.",
-            "feedback_for_executor": "Critic unable to reach decision; replan required.",
-            "evidence": None,
-        }
